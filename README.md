@@ -66,12 +66,43 @@ The `.schain` vault is found in the current directory or any parent (like `.git`
 Other commands:
 
 ```sh
-schain ls           # list key names
-schain unset KEY
+schain ls           # list key names (-v adds the vault each came from)
+schain ls --local   # only the nearest vault's keys
+schain unset KEY    # removes from the nearest vault
 schain passwd       # change passphrase (rotates salt)
 schain reload       # refresh a schain shell's env (automatic in bash/zsh/fish)
 schain help
 ```
+
+## Nested vaults
+
+Every `.schain` from the current directory up to the root is merged, root-most first, nearest wins. A child vault holds only its overrides, so shared credentials live in one place and rotating them is one edit.
+
+```
+~/work/.schain              AWS_PROFILE=sso  NOMAD_TOKEN=prod-tok  DD_API_KEY=abc
+~/work/proj/dev/.schain     NOMAD_TOKEN=dev-tok
+```
+
+In `~/work/proj/dev`: `AWS_PROFILE=sso` and `DD_API_KEY=abc` are inherited, `NOMAD_TOKEN=dev-tok` wins.
+
+`set` writes to the nearest vault, which may be an ancestor; it says so on stderr. `--here` creates a vault in the current directory instead:
+
+```sh
+schain set --here NOMAD_TOKEN     # creates ./.schain even with a parent vault
+```
+
+Each vault keeps its own passphrase and salt. schain unlocks the chain bottom-up and reuses a passphrase that works, so vaults created with the same passphrase prompt once; `schain remember` caches the whole chain (`--local` for the nearest vault only), and so does `schain forget`.
+
+Scope of the other commands: `unset` and `passwd` act on the nearest vault only; `ls`, `exec`, the subshell, and `reload` see the merged chain. `$SCHAIN_ACTIVE` holds the chain, `:`-separated, nearest last.
+
+Stopping the walk:
+
+- `SCHAIN_ROOT=1` stored in a vault (`schain set SCHAIN_ROOT=1`) makes it the top of the chain: nothing above it is read. The key itself is never exported.
+- `SCHAIN_NO_INHERIT=1` in the environment turns inheritance off entirely, nearest vault only.
+
+A child can override an inherited key but cannot remove one; an empty value means an empty value, not "unset". Unset it in the vault that defines it (`schain ls -v` names that vault).
+
+Upgrading from 0.0.1: a nested vault used to hide its ancestors. Now they contribute keys, so variables you did not see before can appear. `SCHAIN_NO_INHERIT=1`, or `SCHAIN_ROOT=1` inside the vault, restores the old scope.
 
 There is no delete command: a vault is just the file, so `rm .schain` (plus `schain forget` if you cached its key).
 
@@ -86,7 +117,7 @@ schain remember     # unlock once, cache the key in the OS
 schain forget       # drop the cached key
 ```
 
-After `remember`, every schain command on that vault runs without prompting. The cache holds the derived key, never the passphrase, in:
+`remember` covers every vault in the chain (`--local` restricts it to the nearest); `forget` drops them all (`--local` likewise). After `remember`, every schain command on that vault runs without prompting. The cache holds the derived key, never the passphrase, in:
 
 - macOS: the login keychain, via the system `security` tool. Unlocked at login, lives until `forget`.
 - Linux: the kernel keyring (`add_key(2)`). Never touches disk, gone on reboot.
@@ -123,7 +154,7 @@ What it does not protect against: anything running as your user while secrets ar
 make test
 ```
 
-Covers roundtrip, wrong passphrase, per-byte tamper rejection, rekey, truncation, cache payload parsing, file permissions.
+Covers roundtrip, wrong passphrase, per-byte tamper rejection, rekey, truncation, cache payload parsing, file permissions, and chain composition (inherit, override, depth, prompt counts, caching, `set --here`, inherited `unset`, walk stops).
 
 ## License
 

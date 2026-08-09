@@ -195,8 +195,12 @@ func (v *vault) close() {
 }
 
 func (v *vault) keys() []string {
-	ks := make([]string, 0, len(v.Secrets))
-	for k := range v.Secrets {
+	return sortedKeys(v.Secrets)
+}
+
+func sortedKeys(m map[string]string) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
 		ks = append(ks, k)
 	}
 	sort.Strings(ks)
@@ -218,4 +222,3 @@ func wipe(b []byte) {
 		b[i] = 0
 	}
 }
-
