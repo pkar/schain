@@ -1,0 +1,5 @@
+# build output
+/schain
+
+# a vault in this repo is likely a local test, not something to publish
+.schain
