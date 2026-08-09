@@ -14,6 +14,9 @@ import (
 
 const vaultName = ".schain"
 
+// version is stamped by the release build via -ldflags.
+var version = "dev"
+
 const usageText = `schain - encrypted per-directory environment variables
 
 The encrypted vault is a ` + vaultName + ` file in your project directory,
@@ -53,6 +56,9 @@ func run(args []string) error {
 	switch args[0] {
 	case "-h", "--help", "help":
 		fmt.Println(usageText)
+		return nil
+	case "-v", "--version", "version":
+		fmt.Println("schain " + version)
 		return nil
 	case "exec":
 		if len(args) < 2 {
