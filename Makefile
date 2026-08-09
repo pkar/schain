@@ -1,5 +1,6 @@
 GO      ?= go
-LDFLAGS ?= -s -w
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS ?= -s -w -X main.version=$(VERSION)
 
 # Install dir: PREFIX wins if given, else first user-writable candidate
 # (Homebrew on Apple Silicon, then /usr/local, then ~/.local), else

@@ -4,11 +4,13 @@ Encrypted per-directory environment variables. Each project keeps its secrets in
 
 ## Install
 
-One-liner (needs Go):
+One-liner (uses the prebuilt binary from the latest [release](https://github.com/pkar/schain/releases); needs Go only if none fits your platform):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/pkar/schain/main/install.sh | sh
 ```
+
+Prebuilt targets: linux amd64/arm64, macOS arm64. Anything else builds from source.
 
 Or with the Go toolchain directly:
 
