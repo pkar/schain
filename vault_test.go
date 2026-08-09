@@ -19,7 +19,7 @@ func TestRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	v.Secrets["AWS_SECRET_ACCESS_KEY"] = "hunter2"
+	v.Secrets["API_TOKEN"] = "hunter2"
 	v.Secrets["EMPTY"] = ""
 	if err := v.save(path); err != nil {
 		t.Fatal(err)
@@ -29,8 +29,8 @@ func TestRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Secrets["AWS_SECRET_ACCESS_KEY"] != "hunter2" {
-		t.Errorf("secret mismatch: %q", got.Secrets["AWS_SECRET_ACCESS_KEY"])
+	if got.Secrets["API_TOKEN"] != "hunter2" {
+		t.Errorf("secret mismatch: %q", got.Secrets["API_TOKEN"])
 	}
 	if val, ok := got.Secrets["EMPTY"]; !ok || val != "" {
 		t.Errorf("empty value not preserved")

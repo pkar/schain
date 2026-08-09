@@ -32,16 +32,16 @@ In your project directory, store secrets (values prompted with echo off). First 
 
 ```sh
 $ cd ~/work/infra
-$ schain set AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+$ schain set API_TOKEN DB_PASSWORD
 new passphrase for ~/work/infra:
 repeat:
 creating /Users/you/work/infra/.schain
-AWS_ACCESS_KEY_ID:
-AWS_SECRET_ACCESS_KEY:
+API_TOKEN:
+DB_PASSWORD:
 saved 2 key(s)
 ```
 
-`KEY=value` also works (`schain set AWS_REGION=us-east-1`) and mixes with prompted keys. Careful: inline values land in shell history, use the prompt form for real secrets.
+`KEY=value` also works (`schain set DEPLOY_ENV=staging`) and mixes with prompted keys. Careful: inline values land in shell history, use the prompt form for real secrets.
 
 Then run bare `schain` to get a subshell with the vars set:
 
@@ -49,7 +49,7 @@ Then run bare `schain` to get a subshell with the vars set:
 $ schain
 passphrase for ~/work/infra:
 schain: entering shell with env from ~/work/infra (3 keys), exit to leave
-$ aws s3 ls
+$ ./deploy.sh
 $ exit          # secrets gone
 ```
 
@@ -58,7 +58,7 @@ Changing secrets from inside the subshell just works: after `schain set` or `sch
 Or wrap a single command:
 
 ```sh
-$ schain exec terraform plan
+$ schain exec make migrate
 ```
 
 The `.schain` vault is found in the current directory or any parent (like `.git`), so everything works from subdirectories too. It is encrypted; whether to commit it is your call (see below).
