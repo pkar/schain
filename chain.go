@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // A chain is every vault from cwd up to the root, merged nearest-wins, so
@@ -27,32 +28,155 @@ type chain struct {
 	paths  []string // parallel to vaults
 }
 
-// findVaults lists vault files from cwd toward the root, nearest first.
-func findVaults() ([]string, error) {
+// workDir is the current directory with symlinks resolved. Vault paths
+// (and the cache entries keyed by them) must not depend on which spelling
+// of a path the shell got there through: /tmp/x and /private/tmp/x are one
+// vault, and git reports the resolved form.
+func workDir() (string, error) {
 	dir, err := os.Getwd()
 	if err != nil {
-		return nil, err
+		return "", err
 	}
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		return resolved, nil
+	}
+	return dir, nil
+}
+
+// isVaultFile reports whether path is a vault file (not a directory).
+func isVaultFile(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.Mode().IsRegular()
+}
+
+// vaultsFrom lists vault files from dir toward the root, nearest first.
+func vaultsFrom(dir string) []string {
 	var paths []string
 	for {
 		p := filepath.Join(dir, vaultName)
-		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
+		if isVaultFile(p) {
 			paths = append(paths, p)
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return paths, nil
+			return paths
 		}
 		dir = parent
 	}
+}
+
+// findVaults lists the vaults for cwd, nearest first.
+func findVaults() ([]string, error) {
+	paths, _, err := resolveVaults()
+	return paths, err
+}
+
+// resolveVaults walks from cwd toward the root, taking one vault per
+// directory level. Inside a linked git worktree, a level with no vault of
+// its own falls back to the main checkout's vault at the same
+// repo-relative path: a worktree is a fresh checkout, so its per-directory
+// vaults are simply not there, and without this every one of them would
+// silently resolve to whatever an ancestor holds. Borrowed paths are
+// returned as they live in the main checkout, so a `remember` there covers
+// every worktree. SCHAIN_NO_WORKTREE=1 turns the fallback off.
+func resolveVaults() (paths []string, borrowed map[string]bool, err error) {
+	cwd, err := workDir()
+	if err != nil {
+		return nil, nil, err
+	}
+	var levels []string
+	var wt *worktree
+	wtLevel := -1
+	noWT := os.Getenv("SCHAIN_NO_WORKTREE") != ""
+	for dir := cwd; ; {
+		if wt == nil && !noWT {
+			if w := findWorktree(dir); w != nil {
+				wt, wtLevel = w, len(levels)
+			}
+		}
+		levels = append(levels, dir)
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+
+	borrowed = map[string]bool{}
+	seen := map[string]bool{}
+	for i, dir := range levels {
+		p := filepath.Join(dir, vaultName)
+		if !isVaultFile(p) {
+			if wt == nil || i > wtLevel {
+				continue // outside the worktree: nothing to borrow
+			}
+			rel, err := filepath.Rel(wt.root, dir)
+			if err != nil {
+				continue
+			}
+			p = filepath.Join(wt.main, rel, vaultName)
+			if !isVaultFile(p) {
+				continue
+			}
+			borrowed[p] = true
+		}
+		if !seen[p] {
+			seen[p] = true
+			paths = append(paths, p)
+		}
+	}
+	if wt != nil {
+		warnUnreachable(wt, seen)
+	}
+	return paths, borrowed, nil
+}
+
+// isBorrowed reports whether a resolved vault lives in the main checkout
+// of a linked worktree rather than in the tree being walked.
+func isBorrowed(path string) bool {
+	_, borrowed, err := resolveVaults()
+	return err == nil && borrowed[path]
+}
+
+// warnedUnreachable keeps the warning to once per run.
+var warnedUnreachable bool
+
+// warnUnreachable reports vaults the main checkout composes with that this
+// worktree cannot reach, which happens when the worktree was created
+// outside the vault root. The borrowed children then resolve against
+// nothing, which is the case most likely to confuse later.
+func warnUnreachable(wt *worktree, have map[string]bool) {
+	if warnedUnreachable {
+		return
+	}
+	var missing []string
+	for _, p := range vaultsFrom(filepath.Dir(wt.main)) {
+		if !have[p] {
+			missing = append(missing, display(p))
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	warnedUnreachable = true
+	fmt.Fprintf(os.Stderr, "schain: warning: this worktree is outside %s, so %d vault(s) the main checkout composes with are not in reach: %s\n",
+		displayDir(wt.main), len(missing), strings.Join(missing, ", "))
 }
 
 // findVaultsUnder walks dir downward for vault files, in lexical order.
 // Unreadable directories are skipped rather than fatal, and directory
 // symlinks are not followed, so the walk cannot loop.
 func findVaultsUnder(dir string) ([]string, error) {
+	return walkVaults(dir, false)
+}
+
+// walkVaults is findVaultsUnder with a choice about nested checkouts:
+// skipNested stops at any directory below root that is itself a git
+// checkout (another worktree, a submodule), whose vaults belong to that
+// checkout rather than this one.
+func walkVaults(root string, skipNested bool) ([]string, error) {
 	var paths []string
-	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil // unreadable: skip it, keep walking
 		}
@@ -60,12 +184,17 @@ func findVaultsUnder(dir string) ([]string, error) {
 			if d.Name() == ".git" {
 				return fs.SkipDir
 			}
+			if skipNested && p != root {
+				if _, err := os.Lstat(filepath.Join(p, ".git")); err == nil {
+					return fs.SkipDir
+				}
+			}
 			return nil
 		}
 		if d.Name() != vaultName {
 			return nil
 		}
-		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
+		if isVaultFile(p) {
 			paths = append(paths, p)
 		}
 		return nil
@@ -95,7 +224,7 @@ func allVaults() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	cwd, err := os.Getwd()
+	cwd, err := workDir()
 	if err != nil {
 		return nil, err
 	}

@@ -114,9 +114,9 @@ func captureStdout(t *testing.T) func() string {
 func TestPrintKeys(t *testing.T) {
 	src := func(k string) string {
 		if k == "A" {
-			return "/tmp/parent/.schain"
+			return display("/tmp/parent/.schain")
 		}
-		return "/tmp/parent/child/.schain"
+		return display("/tmp/parent/child/.schain")
 	}
 	keys := []string{"A", "LONGER"}
 

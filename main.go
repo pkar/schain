@@ -46,10 +46,15 @@ usage:
   schain reload            refresh a schain shell's env (automatic after
                            set/unset in bash/zsh/fish; elsewhere run as:
                            exec schain reload)
+  schain worktree          show which vaults this git worktree uses and
+                           which checkout each one lives in (alias: wt)
 
 first "schain set" creates ` + vaultName + ` in the current directory.
 ` + rootKey + ` set in a vault stops the walk there; SCHAIN_NO_INHERIT=1
 disables inheritance entirely.
+in a linked git worktree, a directory with no vault of its own uses the
+main checkout's vault at the same repo-relative path; SCHAIN_NO_WORKTREE=1
+turns that off.
 inside a schain subshell, $SCHAIN_ACTIVE holds the chain, nearest last.`
 
 func main() {
@@ -89,6 +94,8 @@ func run(args []string) error {
 		return cmdForget(args[1:])
 	case "reload":
 		return cmdReload()
+	case "worktree", "wt":
+		return cmdWorktree(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q (see schain --help)", args[0])
 	}
@@ -132,9 +139,23 @@ func warnForeign(path string) {
 		display(path), display(active[len(active)-1]))
 }
 
+// noteTarget warns when a write lands in the main checkout of a linked
+// worktree: it is one file, so the change is visible from every checkout,
+// not just this one. Reports whether it said anything.
+func noteTarget(path string) bool {
+	if !isBorrowed(path) {
+		return false
+	}
+	fmt.Fprintf(os.Stderr, "schain: writing to %s in the main checkout (shared with every worktree; use --here for a local one)\n", path)
+	return true
+}
+
 // display shortens a path for prompts: /Users/x/work/app/.schain -> ~/work/app
 func display(path string) string {
-	dir := filepath.Dir(path)
+	return displayDir(filepath.Dir(path))
+}
+
+func displayDir(dir string) string {
 	if home, err := os.UserHomeDir(); err == nil {
 		if rel, err := filepath.Rel(home, dir); err == nil && !strings.HasPrefix(rel, "..") {
 			return filepath.Join("~", rel)
@@ -199,7 +220,7 @@ func cmdSet(args []string) error {
 	if err != nil {
 		return err
 	}
-	cwd, err := os.Getwd()
+	cwd, err := workDir()
 	if err != nil {
 		return err
 	}
@@ -225,9 +246,9 @@ func cmdSet(args []string) error {
 			fmt.Fprintf(os.Stderr, "schain: this shell's env predates %s; exit and re-enter to pick it up\n", path)
 		}
 	} else {
-		// Writing to an ancestor changes a broader scope than the
-		// directory the user is standing in; say so.
-		if filepath.Dir(path) != cwd {
+		// Writing somewhere other than here changes a broader scope than
+		// the directory the user is standing in; say so.
+		if !noteTarget(path) && filepath.Dir(path) != cwd {
 			fmt.Fprintf(os.Stderr, "schain: writing to %s (no vault here; use --here to create one)\n", path)
 		}
 		v, err = unlock(path)
@@ -264,6 +285,7 @@ func cmdUnset(args []string) error {
 	if err != nil {
 		return err
 	}
+	noteTarget(path)
 	v, err := unlock(path)
 	if err != nil {
 		return err
@@ -308,8 +330,8 @@ func cmdLs(args []string) error {
 			return err
 		}
 		defer v.close()
-		src := func(string) string { return path }
-		return printKeys(v.keys(), src, verbose, plain)
+		label := func(string) string { return display(path) }
+		return printKeys(v.keys(), label, verbose, plain)
 	}
 	c, err := openChain()
 	if err != nil {
@@ -324,10 +346,21 @@ func cmdLs(args []string) error {
 	if len(c.vaults) > 1 && !plain {
 		verbose = verbose || isTerminal(os.Stdout)
 	}
-	return printKeys(sortedKeys(secrets), c.sourceOf, verbose, plain)
+	_, borrowed, err := resolveVaults()
+	if err != nil {
+		return err
+	}
+	label := func(k string) string {
+		p := c.sourceOf(k)
+		if borrowed[p] {
+			return display(p) + " (main checkout)"
+		}
+		return display(p)
+	}
+	return printKeys(sortedKeys(secrets), label, verbose, plain)
 }
 
-func printKeys(keys []string, source func(string) string, verbose, plain bool) error {
+func printKeys(keys []string, label func(string) string, verbose, plain bool) error {
 	if plain || !verbose {
 		for _, k := range keys {
 			fmt.Println(k)
@@ -336,7 +369,7 @@ func printKeys(keys []string, source func(string) string, verbose, plain bool) e
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	for _, k := range keys {
-		fmt.Fprintf(w, "%s\t%s\n", k, display(source(k)))
+		fmt.Fprintf(w, "%s\t%s\n", k, label(k))
 	}
 	return w.Flush()
 }
@@ -351,6 +384,7 @@ func cmdPasswd() error {
 	if err != nil {
 		return err
 	}
+	noteTarget(path)
 	v, err := unlock(path)
 	if err != nil {
 		return err
