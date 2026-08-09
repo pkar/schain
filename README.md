@@ -79,19 +79,19 @@ schain help
 Every `.schain` from the current directory up to the root is merged, root-most first, nearest wins. A child vault holds only its overrides, so shared credentials live in one place and rotating them is one edit.
 
 ```
-~/work/.schain              AWS_PROFILE=sso  NOMAD_TOKEN=prod-tok  DD_API_KEY=abc
-~/work/proj/dev/.schain     NOMAD_TOKEN=dev-tok
+~/work/.schain              DB_PASSWORD=hunter2  API_TOKEN=prod-tok  SIGNING_KEY=abc
+~/work/proj/dev/.schain     API_TOKEN=dev-tok
 ```
 
-In `~/work/proj/dev`: `AWS_PROFILE=sso` and `DD_API_KEY=abc` are inherited, `NOMAD_TOKEN=dev-tok` wins.
+In `~/work/proj/dev`: `DB_PASSWORD=hunter2` and `SIGNING_KEY=abc` are inherited, `API_TOKEN=dev-tok` wins.
 
 With more than one vault in the chain, `schain ls` on a terminal tags each key with the vault it comes from, since that is what you need before rotating one:
 
 ```sh
 $ schain ls
-AWS_PROFILE   ~/work
-DD_API_KEY    ~/work
-NOMAD_TOKEN   ~/work/proj/dev
+API_TOKEN     ~/work/proj/dev
+DB_PASSWORD   ~/work
+SIGNING_KEY   ~/work
 ```
 
 Piped or redirected output stays bare key names, so `schain ls | ...` keeps working. `-v` forces the tags on, `--plain` forces them off, `--local` lists the nearest vault alone.
@@ -99,7 +99,7 @@ Piped or redirected output stays bare key names, so `schain ls | ...` keeps work
 `set` writes to the nearest vault, which may be an ancestor; it says so on stderr. `--here` creates a vault in the current directory instead:
 
 ```sh
-schain set --here NOMAD_TOKEN     # creates ./.schain even with a parent vault
+schain set --here API_TOKEN     # creates ./.schain even with a parent vault
 ```
 
 Each vault keeps its own passphrase and salt. schain unlocks the chain bottom-up and reuses a passphrase that works, so vaults created with the same passphrase prompt once; `schain remember` caches the whole chain (`--local` for the nearest vault only), and so does `schain forget`.
