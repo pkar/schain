@@ -356,6 +356,176 @@ func TestReloadChainOrder(t *testing.T) {
 	wantSecrets(t, c.secrets(), map[string]string{"S": "child", "A": "1"})
 }
 
+// stubStore records what --all cached, keyed by vault path.
+func stubStore(t *testing.T) map[string]int {
+	t.Helper()
+	stored := map[string]int{}
+	oldStore, oldForget := storeCache, forgetCache
+	storeCache = func(path string, payload []byte, ttl int) error {
+		stored[path] = ttl
+		return nil
+	}
+	forgetCache = func(path string) error {
+		if _, ok := stored[path]; !ok {
+			return errNoCache
+		}
+		delete(stored, path)
+		return nil
+	}
+	t.Cleanup(func() { storeCache, forgetCache = oldStore, oldForget })
+	return stored
+}
+
+func TestFindVaultsUnder(t *testing.T) {
+	d := tree(t, "a", "b")
+	git := filepath.Join(d[0], ".git", "hooks")
+	if err := os.MkdirAll(git, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mkVault(t, d[0], "p", nil)
+	mkVault(t, d[2], "p", nil)
+	mkVault(t, git, "p", nil) // inside .git: not walked
+	if err := os.Mkdir(filepath.Join(d[1], vaultName), 0o700); err != nil {
+		t.Fatal(err) // a directory named .schain is not a vault
+	}
+
+	got, err := findVaultsUnder(d[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{filepath.Join(d[0], vaultName), filepath.Join(d[2], vaultName)}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("found %v, want %v", got, want)
+	}
+}
+
+func TestRememberAll(t *testing.T) {
+	d := tree(t, "app", "app/dev")
+	top := mkVault(t, d[0], "same", map[string]string{"A": "1"})
+	mid := mkVault(t, d[1], "same", map[string]string{"B": "2"})
+	leaf := mkVault(t, d[2], "other", map[string]string{"C": "3"})
+	stubCache(t, nil)
+	stored := stubStore(t)
+	n := stubPrompt(t, "same", "other") // one per distinct passphrase
+	captureStderr(t)
+	t.Chdir(d[0])
+
+	if err := cmdRemember([]string{"--all", "30m"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{top, mid, leaf} {
+		if ttl, ok := stored[p]; !ok || ttl != 1800 {
+			t.Errorf("%s: cached=%v ttl=%d, want ttl 1800", p, ok, ttl)
+		}
+	}
+	if *n != 2 {
+		t.Errorf("prompts = %d, want 2", *n)
+	}
+
+	if err := cmdForget([]string{"--all"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 0 {
+		t.Errorf("still cached: %v", stored)
+	}
+}
+
+// --all reaches up as well as down: run from a subdirectory it still
+// covers the vaults that subdirectory inherits from.
+func TestRememberAllIncludesAncestors(t *testing.T) {
+	d := tree(t, "app", "app/dev")
+	top := mkVault(t, d[0], "p", map[string]string{"A": "1"})
+	leaf := mkVault(t, d[2], "p", map[string]string{"C": "3"})
+	stubCache(t, nil)
+	stored := stubStore(t)
+	stubPrompt(t, "p")
+	captureStderr(t)
+	t.Chdir(d[1])
+
+	if err := cmdRemember([]string{"--all"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := stored[top]; !ok {
+		t.Error("ancestor vault not cached")
+	}
+	if _, ok := stored[leaf]; !ok {
+		t.Error("descendant vault not cached")
+	}
+}
+
+// A vault that will not open is skipped, not fatal.
+func TestRememberAllSkipsUnopenable(t *testing.T) {
+	d := tree(t, "a", "b")
+	good := mkVault(t, d[0], "p", map[string]string{"A": "1"})
+	bad := filepath.Join(d[1], vaultName)
+	if err := os.WriteFile(bad, []byte("not a vault at all, really"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	other := mkVault(t, d[2], "p", map[string]string{"C": "3"})
+	stubCache(t, nil)
+	stored := stubStore(t)
+	stubPrompt(t, "p")
+	stderr := captureStderr(t)
+	t.Chdir(d[0])
+
+	if err := cmdRemember([]string{"--all"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := stored[good]; !ok {
+		t.Error("first vault not cached")
+	}
+	if _, ok := stored[other]; !ok {
+		t.Error("vault after the broken one not cached")
+	}
+	if _, ok := stored[bad]; ok {
+		t.Error("broken vault cached")
+	}
+	if out := stderr(); !strings.Contains(out, "skipping "+bad) {
+		t.Errorf("no skip notice, stderr = %q", out)
+	}
+}
+
+// A dead prompt ends the run instead of asking once per vault.
+func TestRememberAllAbortsOnPromptFailure(t *testing.T) {
+	d := tree(t, "a")
+	mkVault(t, d[0], "p", map[string]string{"A": "1"})
+	mkVault(t, d[1], "q", map[string]string{"B": "2"})
+	stubCache(t, nil)
+	stubStore(t)
+	n := stubPrompt(t) // every prompt fails
+	captureStderr(t)
+	t.Chdir(d[0])
+
+	if err := cmdRemember([]string{"--all"}); err == nil {
+		t.Fatal("want error")
+	}
+	if *n != 0 {
+		t.Errorf("prompts = %d, want 0 answered", *n)
+	}
+}
+
+func TestScopeFlag(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want scope
+		rest int
+	}{
+		{nil, scopeChain, 0},
+		{[]string{"30m"}, scopeChain, 1},
+		{[]string{"--local"}, scopeLocal, 0},
+		{[]string{"--all", "8h"}, scopeAll, 1},
+		{[]string{"-a"}, scopeAll, 0},
+	} {
+		got, rest, err := scopeFlag(tc.args, "remember", "[duration]")
+		if err != nil || got != tc.want || len(rest) != tc.rest {
+			t.Errorf("%v: scope=%v rest=%v err=%v", tc.args, got, rest, err)
+		}
+	}
+	if _, _, err := scopeFlag([]string{"--nope"}, "forget", ""); err == nil {
+		t.Error("unknown flag accepted")
+	}
+}
+
 func TestSecretEnvironChain(t *testing.T) {
 	t.Setenv("A", "stale")
 	env := secretEnviron(map[string]string{"A": "fresh"}, []string{"/p/.schain", "/p/c/.schain"}, "")

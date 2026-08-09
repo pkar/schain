@@ -37,11 +37,12 @@ usage:
                            that, --plain never, --local nearest only)
   schain passwd            change the nearest vault's passphrase
   schain remember [dur]    cache keys for the chain in an OS store; skip
-                           passphrase prompts (--local: nearest vault)
+                           passphrase prompts (--local: nearest vault,
+                           --all: also every vault below this directory)
                            (macOS: login keychain; linux: kernel keyring)
                            dur: 30m, 8h, 1h30m; bare number = minutes;
                            omitted = no expiry
-  schain forget            drop cached keys (--local: nearest vault)
+  schain forget            drop cached keys (--local / --all as above)
   schain reload            refresh a schain shell's env (automatic after
                            set/unset in bash/zsh/fish; elsewhere run as:
                            exec schain reload)
@@ -363,17 +364,17 @@ func cmdPasswd() error {
 	if err := v.rekey(pass); err != nil {
 		return err
 	}
-	cacheForget(path) // stale after rekey; best effort
+	forgetCache(path) // stale after rekey; best effort
 	return v.save(path)
 }
 
 func cmdRemember(args []string) error {
-	local := false
-	if len(args) > 0 && args[0] == "--local" {
-		local, args = true, args[1:]
+	scope, args, err := scopeFlag(args, "remember", "[duration]")
+	if err != nil {
+		return err
 	}
 	if len(args) > 1 {
-		return fmt.Errorf("usage: schain remember [--local] [duration]")
+		return fmt.Errorf("usage: schain remember [--local|--all] [duration]")
 	}
 	ttl := 0
 	if len(args) == 1 {
@@ -383,7 +384,21 @@ func cmdRemember(args []string) error {
 		}
 		ttl = d
 	}
-	if local {
+	if scope == scopeAll {
+		paths, err := allVaults()
+		if err != nil {
+			return err
+		}
+		done, _, err := eachVault(paths, func(p string, v *vault) error {
+			return rememberVault(p, v, ttl)
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "schain: cached %d of %d vault(s); no passphrase until forget\n", done, len(paths))
+		return nil
+	}
+	if scope == scopeLocal {
 		path, err := mustFindVault()
 		if err != nil {
 			return err
@@ -393,7 +408,7 @@ func cmdRemember(args []string) error {
 			return err
 		}
 		defer v.close()
-		return rememberVault(path, v, ttl)
+		return rememberOne(path, v, ttl)
 	}
 	c, err := openChain()
 	if err != nil {
@@ -401,7 +416,7 @@ func cmdRemember(args []string) error {
 	}
 	defer c.close()
 	for i, v := range c.vaults {
-		if err := rememberVault(c.paths[i], v, ttl); err != nil {
+		if err := rememberOne(c.paths[i], v, ttl); err != nil {
 			return err
 		}
 	}
@@ -411,11 +426,41 @@ func cmdRemember(args []string) error {
 func rememberVault(path string, v *vault, ttl int) error {
 	payload := cachePayload(v.salt, v.key)
 	defer wipe(payload)
-	if err := cacheStore(path, payload, ttl); err != nil {
+	return storeCache(path, payload, ttl)
+}
+
+func rememberOne(path string, v *vault, ttl int) error {
+	if err := rememberVault(path, v, ttl); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "schain: key for %s cached; no passphrase until forget\n", display(path))
 	return nil
+}
+
+// Which vaults remember/forget act on.
+type scope int
+
+const (
+	scopeChain scope = iota // the chain for cwd (default)
+	scopeLocal              // nearest vault only
+	scopeAll                // the chain plus every vault underneath cwd
+)
+
+// scopeFlag pulls a leading --local/--all off the arguments.
+func scopeFlag(args []string, cmd, tail string) (scope, []string, error) {
+	if len(args) == 0 {
+		return scopeChain, args, nil
+	}
+	switch args[0] {
+	case "--local":
+		return scopeLocal, args[1:], nil
+	case "--all", "-a":
+		return scopeAll, args[1:], nil
+	}
+	if strings.HasPrefix(args[0], "-") {
+		return 0, nil, fmt.Errorf("usage: schain %s [--local|--all] %s", cmd, tail)
+	}
+	return scopeChain, args, nil
 }
 
 // parseTTL accepts Go durations ("30m", "8h", "1h30m", "90s"); a bare
@@ -435,31 +480,43 @@ func parseTTL(s string) (int, error) {
 }
 
 func cmdForget(args []string) error {
-	local := false
-	if len(args) > 0 && args[0] == "--local" {
-		local, args = true, args[1:]
-	}
-	if len(args) > 0 {
-		return fmt.Errorf("usage: schain forget [--local]")
-	}
-	paths, err := findVaults()
+	scope, args, err := scopeFlag(args, "forget", "")
 	if err != nil {
 		return err
 	}
-	if len(paths) == 0 {
-		return noVaultErr()
+	if len(args) > 0 {
+		return fmt.Errorf("usage: schain forget [--local|--all]")
 	}
-	warnForeign(paths[0])
-	if local {
-		paths = paths[:1]
+	var paths []string
+	if scope == scopeAll {
+		if paths, err = allVaults(); err != nil {
+			return err
+		}
+	} else {
+		if paths, err = findVaults(); err != nil {
+			return err
+		}
+		if len(paths) == 0 {
+			return noVaultErr()
+		}
+		warnForeign(paths[0])
+		if scope == scopeLocal {
+			paths = paths[:1]
+		}
 	}
 	n := 0
 	for _, p := range paths {
-		if cacheForget(p) != nil {
+		if forgetCache(p) != nil {
 			continue
 		}
 		n++
-		fmt.Fprintf(os.Stderr, "schain: forgot cached key for %s\n", display(p))
+		if scope != scopeAll {
+			fmt.Fprintf(os.Stderr, "schain: forgot cached key for %s\n", display(p))
+		}
+	}
+	if scope == scopeAll {
+		fmt.Fprintf(os.Stderr, "schain: forgot %d cached key(s) across %d vault(s)\n", n, len(paths))
+		return nil
 	}
 	if n == 0 {
 		return fmt.Errorf("nothing cached for %s", display(paths[0]))
