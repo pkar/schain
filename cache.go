@@ -19,6 +19,12 @@ import (
 
 var errNoCache = errors.New("no cached key")
 
+// Indirection points for tests.
+var (
+	storeCache  = cacheStore
+	forgetCache = cacheForget
+)
+
 func cachePayload(salt, key []byte) []byte {
 	return []byte(hex.EncodeToString(salt) + ":" + hex.EncodeToString(key))
 }

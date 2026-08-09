@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -45,6 +47,69 @@ func findVaults() ([]string, error) {
 	}
 }
 
+// findVaultsUnder walks dir downward for vault files, in lexical order.
+// Unreadable directories are skipped rather than fatal, and directory
+// symlinks are not followed, so the walk cannot loop.
+func findVaultsUnder(dir string) ([]string, error) {
+	var paths []string
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // unreadable: skip it, keep walking
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.Name() != vaultName {
+			return nil
+		}
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
+			paths = append(paths, p)
+		}
+		return nil
+	})
+	return paths, err
+}
+
+// mergePaths concatenates path lists, first occurrence wins.
+func mergePaths(lists ...[]string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, l := range lists {
+		for _, p := range l {
+			if !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
+// allVaults is every vault this directory inherits from plus every one
+// underneath it: what --all operates on.
+func allVaults() ([]string, error) {
+	up, err := findVaults()
+	if err != nil {
+		return nil, err
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	down, err := findVaultsUnder(cwd)
+	if err != nil {
+		return nil, err
+	}
+	paths := mergePaths(reversed(up), down)
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("no %s here, above, or below", vaultName)
+	}
+	return paths, nil
+}
+
 // findVault returns the nearest vault, "" if none.
 func findVault() (string, error) {
 	paths, err := findVaults()
@@ -77,10 +142,10 @@ func openChain() (*chain, error) {
 // passphrase asks once.
 func loadChain(paths []string) (*chain, error) {
 	c := &chain{}
-	var pass []byte
-	defer func() { wipe(pass) }()
+	var known [][]byte
+	defer func() { wipeAll(known) }()
 	for i, p := range paths {
-		v, err := unlockChained(p, &pass)
+		v, err := unlockKnown(p, &known)
 		if err != nil {
 			c.close()
 			if i > 0 {
@@ -99,15 +164,26 @@ func loadChain(paths []string) (*chain, error) {
 	return c, nil
 }
 
-// unlockChained opens one vault: cached key, then the passphrase already
-// entered for another vault in the chain, then a prompt.
-func unlockChained(path string, pass *[]byte) (*vault, error) {
+// abortErr marks a failure that should stop a batch of vaults (no input
+// on the terminal) instead of skipping one of them.
+type abortErr struct{ err error }
+
+func (e abortErr) Error() string { return e.err.Error() }
+func (e abortErr) Unwrap() error { return e.err }
+
+// unlockKnown opens one vault: cached key, then any passphrase already
+// accepted in this run, then a prompt. A passphrase that works moves to
+// the front of the list, since neighbouring vaults tend to share one.
+func unlockKnown(path string, known *[][]byte) (*vault, error) {
 	if v := openCached(path); v != nil {
 		return v, nil
 	}
-	if len(*pass) > 0 {
-		v, err := openVault(path, *pass)
+	for i, p := range *known {
+		v, err := openVault(path, p)
 		if err == nil {
+			k := *known
+			copy(k[1:i+1], k[:i])
+			k[0] = p
 			return v, nil
 		}
 		if err != errBadPassphrase {
@@ -116,16 +192,49 @@ func unlockChained(path string, pass *[]byte) (*vault, error) {
 	}
 	p, err := promptSecret(fmt.Sprintf("passphrase for %s: ", display(path)))
 	if err != nil {
-		return nil, err
+		return nil, abortErr{err}
 	}
 	v, err := openVault(path, p)
 	if err != nil {
 		wipe(p)
 		return nil, err
 	}
-	wipe(*pass)
-	*pass = p
+	*known = append([][]byte{p}, *known...)
 	return v, nil
+}
+
+// eachVault opens the given vaults one at a time, hands each to fn, and
+// closes it again. A vault that will not open is counted as skipped, so
+// one bad passphrase does not abandon the rest; only a dead prompt stops
+// the run.
+func eachVault(paths []string, fn func(string, *vault) error) (done int, skipped []string, err error) {
+	var known [][]byte
+	defer func() { wipeAll(known) }()
+	for _, p := range paths {
+		v, err := unlockKnown(p, &known)
+		if err != nil {
+			var ae abortErr
+			if errors.As(err, &ae) {
+				return done, skipped, err
+			}
+			skipped = append(skipped, p)
+			fmt.Fprintf(os.Stderr, "schain: skipping %s: %v\n", p, err)
+			continue
+		}
+		err = fn(p, v)
+		v.close()
+		if err != nil {
+			return done, skipped, err
+		}
+		done++
+	}
+	return done, skipped, nil
+}
+
+func wipeAll(bs [][]byte) {
+	for _, b := range bs {
+		wipe(b)
+	}
 }
 
 // secrets merges the chain: root-most first, nearest overwrites.

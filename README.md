@@ -102,7 +102,7 @@ Piped or redirected output stays bare key names, so `schain ls | ...` keeps work
 schain set --here API_TOKEN     # creates ./.schain even with a parent vault
 ```
 
-Each vault keeps its own passphrase and salt. schain unlocks the chain bottom-up and reuses a passphrase that works, so vaults created with the same passphrase prompt once; `schain remember` caches the whole chain (`--local` for the nearest vault only), and so does `schain forget`.
+Each vault keeps its own passphrase and salt. schain unlocks the chain bottom-up and reuses a passphrase that works, so vaults created with the same passphrase prompt once; `schain remember` caches the whole chain (`--local` for the nearest vault only, `--all` for every vault below this directory too), and so does `schain forget`.
 
 Scope of the other commands: `unset` and `passwd` act on the nearest vault only; `ls`, `exec`, the subshell, and `reload` see the merged chain. `$SCHAIN_ACTIVE` holds the chain, `:`-separated, nearest last.
 
@@ -124,11 +124,15 @@ Running schain commands in the "wrong" place is caught: with no vault in reach i
 Opt in per vault:
 
 ```sh
-schain remember     # unlock once, cache the key in the OS
-schain forget       # drop the cached key
+schain remember           # unlock once, cache the key in the OS
+schain remember --all     # same for every vault above and below here
+schain forget             # drop the cached key
+schain forget --all       # drop them for the same set
 ```
 
-`remember` covers every vault in the chain (`--local` restricts it to the nearest); `forget` drops them all (`--local` likewise). After `remember`, every schain command on that vault runs without prompting. The cache holds the derived key, never the passphrase, in:
+`remember` covers every vault in the chain (`--local` restricts it to the nearest); `forget` drops them all (`--local` likewise). After `remember`, every schain command on that vault runs without prompting.
+
+`--all` adds a walk downward: every `.schain` under the current directory, plus the chain above it. Run it once at the top of a monorepo and every project underneath is prompt-free. A passphrase that opens one vault is tried on the rest before asking again, so a tree sharing one passphrase costs one prompt and a tree with three costs three. Vaults that will not open (wrong passphrase, unreadable, not a vault) are named on stderr and skipped, so one bad file does not abandon the run. The walk does not follow symlinks and does not descend into `.git`. The cache holds the derived key, never the passphrase, in:
 
 - macOS: the login keychain, via the system `security` tool. Unlocked at login, lives until `forget`.
 - Linux: the kernel keyring (`add_key(2)`). Never touches disk, gone on reboot.
@@ -165,7 +169,7 @@ What it does not protect against: anything running as your user while secrets ar
 make test
 ```
 
-Covers roundtrip, wrong passphrase, per-byte tamper rejection, rekey, truncation, cache payload parsing, file permissions, and chain composition (inherit, override, depth, prompt counts, caching, `set --here`, inherited `unset`, walk stops).
+Covers roundtrip, wrong passphrase, per-byte tamper rejection, rekey, truncation, cache payload parsing, file permissions, chain composition (inherit, override, depth, prompt counts, caching, `set --here`, inherited `unset`, walk stops), and bulk `--all` (recursive discovery, passphrase reuse, skipping vaults that will not open).
 
 ## License
 
