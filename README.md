@@ -71,6 +71,7 @@ schain ls --local   # only the nearest vault's keys
 schain unset KEY    # removes from the nearest vault
 schain passwd       # change passphrase (rotates salt)
 schain reload       # refresh a schain shell's env (automatic in bash/zsh/fish)
+schain worktree     # which vaults a git worktree uses, and from where
 schain help
 ```
 
@@ -112,6 +113,30 @@ Stopping the walk:
 - `SCHAIN_NO_INHERIT=1` in the environment turns inheritance off entirely, nearest vault only.
 
 A child can override an inherited key but cannot remove one; an empty value means an empty value, not "unset". Unset it in the vault that defines it (`schain ls -v` names that vault).
+
+## Git worktrees
+
+A linked worktree is a second checkout at another path. Vault files are untracked, so a fresh worktree has none of the repo's per-directory vaults, and every key that a child vault existed to override would quietly resolve to whatever an ancestor holds. schain closes that gap at lookup time: inside a linked worktree, a directory with no vault of its own uses the **main checkout's** vault at the same repo-relative path.
+
+```sh
+$ cd ~/work/repo/.claude/worktrees/feature/prod
+$ schain ls -v
+API_TOKEN    ~/work/repo/prod (main checkout)
+DB_PASSWORD  ~/work
+```
+
+Nothing is copied, so there is nothing to re-sync after rotating a key and nothing to prune after deleting a vault. The main checkout's file is used at its own path, which also means `schain remember` run there covers every worktree, with no second prompt.
+
+```sh
+schain worktree     # which vaults this worktree uses, and from where (alias: wt)
+```
+
+The rest of the rules:
+
+- **A vault in the worktree wins.** `schain set --here KEY` creates one, for a worktree that should deliberately differ.
+- **Writes go to the main checkout.** `set`, `unset`, and `passwd` acting on a borrowed vault change that one file, so a rotation from a worktree is visible everywhere at once. schain names the file on stderr when it does this.
+- **A worktree outside the vault root gets a warning**, naming the vaults the main checkout composes with that this worktree cannot reach.
+- Detection reads git's own files (`.git` → `commondir`), so no `git` binary is needed. Submodules use the same `.git` indirection but have no `commondir`, so they never borrow. `SCHAIN_NO_WORKTREE=1` turns the whole thing off.
 
 Upgrading from 0.0.1: a nested vault used to hide its ancestors. Now they contribute keys, so variables you did not see before can appear. `SCHAIN_NO_INHERIT=1`, or `SCHAIN_ROOT=1` inside the vault, restores the old scope.
 
@@ -169,7 +194,7 @@ What it does not protect against: anything running as your user while secrets ar
 make test
 ```
 
-Covers roundtrip, wrong passphrase, per-byte tamper rejection, rekey, truncation, cache payload parsing, file permissions, chain composition (inherit, override, depth, prompt counts, caching, `set --here`, inherited `unset`, walk stops), and bulk `--all` (recursive discovery, passphrase reuse, skipping vaults that will not open).
+Covers roundtrip, wrong passphrase, per-byte tamper rejection, rekey, truncation, cache payload parsing, file permissions, chain composition (inherit, override, depth, prompt counts, caching, `set --here`, inherited `unset`, walk stops), bulk `--all` (recursive discovery, passphrase reuse, skipping vaults that will not open), and git worktrees (borrowing, local override, writes reaching the main checkout, submodules excluded, unreachable-ancestor warning, plus one test against a real `git worktree add`).
 
 ## License
 
