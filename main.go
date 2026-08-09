@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 )
 
@@ -31,8 +32,9 @@ usage:
   schain set --here KEY    store in a vault in this directory, creating
                            it even when a parent vault exists
   schain unset KEY...      remove keys from the nearest vault
-  schain ls [--local] [-v] list key names (-v shows the source vault,
-                           --local only the nearest vault)
+  schain ls [--local] [-v] list key names; on a terminal each key is
+                           tagged with the vault it comes from (-v forces
+                           that, --plain never, --local nearest only)
   schain passwd            change the nearest vault's passphrase
   schain remember [dur]    cache keys for the chain in an OS store; skip
                            passphrase prompts (--local: nearest vault)
@@ -282,15 +284,17 @@ func cmdUnset(args []string) error {
 }
 
 func cmdLs(args []string) error {
-	local, verbose := false, false
+	local, verbose, plain := false, false, false
 	for _, a := range args {
 		switch a {
 		case "--local":
 			local = true
 		case "-v", "--verbose":
 			verbose = true
+		case "--plain":
+			plain = true
 		default:
-			return fmt.Errorf("usage: schain ls [--local] [-v]")
+			return fmt.Errorf("usage: schain ls [--local] [-v] [--plain]")
 		}
 	}
 	if local {
@@ -303,14 +307,8 @@ func cmdLs(args []string) error {
 			return err
 		}
 		defer v.close()
-		for _, k := range v.keys() {
-			if verbose {
-				fmt.Printf("%s\t%s\n", k, display(path))
-				continue
-			}
-			fmt.Println(k)
-		}
-		return nil
+		src := func(string) string { return path }
+		return printKeys(v.keys(), src, verbose, plain)
 	}
 	c, err := openChain()
 	if err != nil {
@@ -319,14 +317,32 @@ func cmdLs(args []string) error {
 	defer c.close()
 	secrets := c.secrets()
 	defer wipeMap(secrets)
-	for _, k := range sortedKeys(secrets) {
-		if verbose {
-			fmt.Printf("%s\t%s\n", k, display(c.sourceOf(k)))
-			continue
-		}
-		fmt.Println(k)
+	// With more than one vault in play, which vault owns a key is the
+	// thing you need before rotating it: show it unless the output is
+	// being piped somewhere that expects bare key names.
+	if len(c.vaults) > 1 && !plain {
+		verbose = verbose || isTerminal(os.Stdout)
 	}
-	return nil
+	return printKeys(sortedKeys(secrets), c.sourceOf, verbose, plain)
+}
+
+func printKeys(keys []string, source func(string) string, verbose, plain bool) error {
+	if plain || !verbose {
+		for _, k := range keys {
+			fmt.Println(k)
+		}
+		return nil
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	for _, k := range keys {
+		fmt.Fprintf(w, "%s\t%s\n", k, display(source(k)))
+	}
+	return w.Flush()
+}
+
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
 func cmdPasswd() error {

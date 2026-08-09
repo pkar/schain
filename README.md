@@ -66,7 +66,7 @@ The `.schain` vault is found in the current directory or any parent (like `.git`
 Other commands:
 
 ```sh
-schain ls           # list key names (-v adds the vault each came from)
+schain ls           # list key names
 schain ls --local   # only the nearest vault's keys
 schain unset KEY    # removes from the nearest vault
 schain passwd       # change passphrase (rotates salt)
@@ -84,6 +84,17 @@ Every `.schain` from the current directory up to the root is merged, root-most f
 ```
 
 In `~/work/proj/dev`: `AWS_PROFILE=sso` and `DD_API_KEY=abc` are inherited, `NOMAD_TOKEN=dev-tok` wins.
+
+With more than one vault in the chain, `schain ls` on a terminal tags each key with the vault it comes from, since that is what you need before rotating one:
+
+```sh
+$ schain ls
+AWS_PROFILE   ~/work
+DD_API_KEY    ~/work
+NOMAD_TOKEN   ~/work/proj/dev
+```
+
+Piped or redirected output stays bare key names, so `schain ls | ...` keeps working. `-v` forces the tags on, `--plain` forces them off, `--local` lists the nearest vault alone.
 
 `set` writes to the nearest vault, which may be an ancestor; it says so on stderr. `--here` creates a vault in the current directory instead:
 

@@ -96,6 +96,43 @@ func captureStderr(t *testing.T) func() string {
 	}
 }
 
+func captureStdout(t *testing.T) func() string {
+	t.Helper()
+	f, err := os.CreateTemp("", "schain-out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = f
+	t.Cleanup(func() { os.Stdout = old; f.Close(); os.Remove(f.Name()) })
+	return func() string {
+		b, _ := os.ReadFile(f.Name())
+		return string(b)
+	}
+}
+
+func TestPrintKeys(t *testing.T) {
+	src := func(k string) string {
+		if k == "A" {
+			return "/tmp/parent/.schain"
+		}
+		return "/tmp/parent/child/.schain"
+	}
+	keys := []string{"A", "LONGER"}
+
+	out := captureStdout(t)
+	printKeys(keys, src, true, false)
+	if got, want := out(), "A       /tmp/parent\nLONGER  /tmp/parent/child\n"; got != want {
+		t.Errorf("annotated output = %q, want %q", got, want)
+	}
+
+	out = captureStdout(t)
+	printKeys(keys, src, true, true) // --plain wins over -v
+	if got, want := out(), "A\nLONGER\n"; got != want {
+		t.Errorf("plain output = %q, want %q", got, want)
+	}
+}
+
 func mustChain(t *testing.T) *chain {
 	t.Helper()
 	c, err := openChain()
