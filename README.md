@@ -72,6 +72,7 @@ schain unset KEY    # removes from the nearest vault
 schain passwd       # change passphrase (rotates salt)
 schain reload       # refresh a schain shell's env (automatic in bash/zsh/fish)
 schain worktree     # which vaults a git worktree uses, and from where
+schain history      # what changed in this vault, and when
 schain help
 ```
 
@@ -114,6 +115,44 @@ Stopping the walk:
 
 A child can override an inherited key but cannot remove one; an empty value means an empty value, not "unset". Unset it in the vault that defines it (`schain ls -v` names that vault).
 
+## History
+
+Every `set` and `unset` keeps the value it replaced, three per key, inside the vault. A rotation that breaks something is one command to undo:
+
+```sh
+$ schain history
+KEY          KEPT  LAST CHANGE          BY
+API_TOKEN    3     2026-08-09 17:10:38  you@laptop
+DB_PASSWORD  1     2026-08-09 17:10:35  you@laptop
+
+$ schain history API_TOKEN
+current  since 2026-08-09 17:10:38  you@laptop
+1 back   until 2026-08-09 17:10:38  you@laptop
+2 back   until 2026-08-09 17:10:37  you@laptop
+3 back   until 2026-08-09 17:10:35  you@laptop  absent: reverting removes the key
+
+$ schain history revert API_TOKEN      # or: revert API_TOKEN 2
+schain: API_TOKEN restored to the value from 2026-08-09 17:10:38
+schain: undo with: schain history revert API_TOKEN
+```
+
+**Old values are never printed.** `history` shows what changed and when, never a value; `revert` puts one back without displaying it. That keeps the property that no schain command writes a secret to your terminal.
+
+Reverting is an ordinary change, so it is kept too and can be reverted in turn. That also means the step count shifts after a revert: read `schain history KEY` again before stepping back further. Creating a key is recorded as well, so `revert` on a freshly added key removes it, and a key you `unset` by mistake comes back.
+
+```sh
+schain history off             # stop recording in this vault
+schain history on [N]          # record again, keeping N (default 3)
+schain history purge [KEY...]  # drop what is stored
+```
+
+Two things worth knowing before you rely on it:
+
+- **History weakens deletion.** After `unset`, the old value is still in the file until it ages out or you `purge`. If you put a real secret somewhere by mistake, `schain unset KEY` then `schain history purge KEY`. (If you commit your vault, git already keeps every old ciphertext, so this changes nothing there.)
+- **A vault holding history is written in a newer on-disk format** (`schain2`), which schain older than 0.0.6 reports as "not a schain vault". A vault switched off with `history off` and purged goes back to the original format, so it stays readable by older builds. Nothing else about the format changed: same crypto, same header, same per-vault salt.
+
+History belongs to one vault file, so these commands act on the nearest vault, never the merged chain.
+
 ## Git worktrees
 
 A linked worktree is a second checkout at another path. Vault files are untracked, so a fresh worktree has none of the repo's per-directory vaults, and every key that a child vault existed to override would quietly resolve to whatever an ancestor holds. schain closes that gap at lookup time: inside a linked worktree, a directory with no vault of its own uses the **main checkout's** vault at the same repo-relative path.
@@ -140,7 +179,7 @@ The rest of the rules:
 
 Upgrading from 0.0.1: a nested vault used to hide its ancestors. Now they contribute keys, so variables you did not see before can appear. `SCHAIN_NO_INHERIT=1`, or `SCHAIN_ROOT=1` inside the vault, restores the old scope.
 
-There is no delete command: a vault is just the file, so `rm .schain` (plus `schain forget` if you cached its key).
+There is no delete command: a vault is just the file, so `rm .schain` (plus `schain forget` if you cached its key). That also takes its history with it.
 
 Running schain commands in the "wrong" place is caught: with no vault in reach it says so, adding where the current shell's env came from if you are inside a schain shell; and operating on a different project's vault than the one your shell came from prints a warning first.
 
@@ -183,6 +222,7 @@ Built entirely on the Go standard library's crypto:
 - `schain exec` and the subshell use `execve`, replacing the schain process. No parent process holds decrypted secrets.
 - Iteration count below 100,000 in a vault file is refused (downgrade guard).
 - Key material is zeroed after use, best effort (Go's GC can copy memory).
+- Replaced values are kept in the vault (see [History](#history)), so a value survives `unset` until it ages out or you `purge`. Everything stays inside the same encrypted file.
 
 Committing `.schain` to git: it is ciphertext, so it only exposes what any encrypted blob exposes (size, and it invites offline passphrase guessing). With a strong passphrase that is fine; with a weak one, add it to `.gitignore`.
 
@@ -194,7 +234,7 @@ What it does not protect against: anything running as your user while secrets ar
 make test
 ```
 
-Covers roundtrip, wrong passphrase, per-byte tamper rejection, rekey, truncation, cache payload parsing, file permissions, chain composition (inherit, override, depth, prompt counts, caching, `set --here`, inherited `unset`, walk stops), bulk `--all` (recursive discovery, passphrase reuse, skipping vaults that will not open), and git worktrees (borrowing, local override, writes reaching the main checkout, submodules excluded, unreachable-ancestor warning, plus one test against a real `git worktree add`).
+Covers roundtrip, wrong passphrase, per-byte tamper rejection, rekey, truncation, cache payload parsing, file permissions, chain composition (inherit, override, depth, prompt counts, caching, `set --here`, inherited `unset`, walk stops), bulk `--all` (recursive discovery, passphrase reuse, skipping vaults that will not open), and git worktrees (borrowing, local override, writes reaching the main checkout, submodules excluded, unreachable-ancestor warning, plus one test against a real `git worktree add`), and history (format round trip, cap and ordering, creation and deletion, revert including to-absent and undo-the-undo, off/purge returning the file to the old format, and that no value reaches stdout).
 
 ## License
 

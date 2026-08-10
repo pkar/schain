@@ -14,21 +14,31 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // File format (all bytes, big-endian ints):
 //
-//	magic   [8]  "schain1\n"
+//	magic   [8]  "schain1\n" or "schain2\n"
 //	iters   [4]  PBKDF2-SHA256 iteration count
 //	salt    [16] random, fixed per vault (rotated on passwd)
 //	nonce   [12] random, fresh on every write
-//	body    [..] AES-256-GCM ciphertext of JSON map[string]string
+//	body    [..] AES-256-GCM ciphertext of the payload
+//
+// The payload is JSON: a bare map[string]string under schain1, and an
+// envelope {"secrets":..., "history":...} under schain2. A vault is only
+// written as schain2 once it actually holds history, so vaults with
+// history switched off stay readable by older schain builds.
 //
 // The AEAD additional data covers magic+iters+salt, so tampering with
 // KDF parameters is detected, not just tampering with the body.
 
 const (
 	magic        = "schain1\n"
+	magic2       = "schain2\n"
+	magicLen     = len(magic)
 	saltLen      = 16
 	nonceLen     = 12
 	keyLen       = 32
@@ -38,11 +48,27 @@ const (
 
 var errBadPassphrase = errors.New("wrong passphrase or corrupted vault")
 
+// A revision is a value that was replaced: what it was, when it stopped
+// being current, and who made that change.
+type revision struct {
+	At   int64  `json:"t"`
+	Val  string `json:"v,omitempty"`
+	By   string `json:"by,omitempty"`
+	Gone bool   `json:"gone,omitempty"` // the key did not exist before
+}
+
 type vault struct {
 	iters   int
 	salt    []byte
 	key     []byte // derived; kept for re-encryption on save
 	Secrets map[string]string
+	History map[string][]revision // per key, newest first
+}
+
+// envelope is the schain2 payload.
+type envelope struct {
+	Secrets map[string]string     `json:"secrets"`
+	History map[string][]revision `json:"history,omitempty"`
 }
 
 func deriveKey(passphrase []byte, salt []byte, iters int) ([]byte, error) {
@@ -61,14 +87,15 @@ func newVault(passphrase []byte) (*vault, error) {
 	return &vault{iters: defaultIters, salt: salt, key: key, Secrets: map[string]string{}}, nil
 }
 
-func header(iters int, salt []byte) []byte {
-	h := make([]byte, 0, len(magic)+4+saltLen)
-	h = append(h, magic...)
+func header(m string, iters int, salt []byte) []byte {
+	h := make([]byte, 0, magicLen+4+saltLen)
+	h = append(h, m...)
 	h = binary.BigEndian.AppendUint32(h, uint32(iters))
 	return append(h, salt...)
 }
 
 type vaultFile struct {
+	magic             string
 	iters             int
 	salt, nonce, body []byte
 	hdr               []byte
@@ -79,17 +106,26 @@ func readVaultFile(path string) (*vaultFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	hdrLen := len(magic) + 4 + saltLen
-	if len(blob) < hdrLen+nonceLen+16 || string(blob[:len(magic)]) != magic {
+	hdrLen := magicLen + 4 + saltLen
+	if len(blob) < hdrLen+nonceLen+16 {
 		return nil, fmt.Errorf("%s: not a schain vault", path)
 	}
-	iters := int(binary.BigEndian.Uint32(blob[len(magic):]))
+	m := string(blob[:magicLen])
+	if m != magic && m != magic2 {
+		if strings.HasPrefix(m, "schain") {
+			return nil, fmt.Errorf("%s: format %q is newer than this schain understands; upgrade schain",
+				path, strings.TrimSpace(m))
+		}
+		return nil, fmt.Errorf("%s: not a schain vault", path)
+	}
+	iters := int(binary.BigEndian.Uint32(blob[magicLen:]))
 	if iters < minIters {
 		return nil, fmt.Errorf("%s: refusing weak iteration count %d", path, iters)
 	}
 	return &vaultFile{
+		magic: m,
 		iters: iters,
-		salt:  blob[len(magic)+4 : hdrLen],
+		salt:  blob[magicLen+4 : hdrLen],
 		nonce: blob[hdrLen : hdrLen+nonceLen],
 		body:  blob[hdrLen+nonceLen:],
 		hdr:   blob[:hdrLen],
@@ -107,7 +143,19 @@ func decrypt(f *vaultFile, key []byte, path string) (*vault, error) {
 		return nil, errBadPassphrase
 	}
 	v := &vault{iters: f.iters, salt: append([]byte(nil), f.salt...), key: key}
-	err = json.Unmarshal(plain, &v.Secrets)
+	if f.magic == magic2 {
+		var env envelope
+		if err = json.Unmarshal(plain, &env); err == nil && env.Secrets == nil {
+			// A flat payload under a schain2 header: the AEAD binds the
+			// magic, so this means the file was built by hand.
+			err = errors.New("no secrets in envelope")
+		}
+		v.Secrets, v.History = env.Secrets, env.History
+	} else {
+		if err = json.Unmarshal(plain, &v.Secrets); err == nil && v.Secrets == nil {
+			v.Secrets = map[string]string{}
+		}
+	}
 	wipe(plain)
 	if err != nil {
 		wipe(key)
@@ -142,7 +190,17 @@ func openVaultKey(path string, salt, key []byte) (*vault, error) {
 }
 
 func (v *vault) save(path string) error {
-	plain, err := json.Marshal(v.Secrets)
+	// Stay on the original format until there is history to store, so a
+	// vault that never keeps one is still readable by older builds.
+	m := magic
+	var plain []byte
+	var err error
+	if len(v.History) > 0 {
+		m = magic2
+		plain, err = json.Marshal(envelope{Secrets: v.Secrets, History: v.History})
+	} else {
+		plain, err = json.Marshal(v.Secrets)
+	}
 	if err != nil {
 		return err
 	}
@@ -155,7 +213,7 @@ func (v *vault) save(path string) error {
 	if _, err := rand.Read(nonce); err != nil {
 		return err
 	}
-	hdr := header(v.iters, v.salt)
+	hdr := header(m, v.iters, v.salt)
 	out := append(append(hdr, nonce...), aead.Seal(nil, nonce, plain, hdr)...)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -192,7 +250,85 @@ func (v *vault) close() {
 	for k := range v.Secrets {
 		v.Secrets[k] = ""
 	}
+	for _, revs := range v.History {
+		for i := range revs {
+			revs[i].Val = ""
+		}
+	}
 }
+
+// keep is how many past values this vault holds per key: the default
+// unless SCHAIN_HISTORY says otherwise, 0 meaning history is off. The
+// setting lives as a reserved key in the secrets map, so switching it off
+// needs no format change.
+func (v *vault) keep() int {
+	s, ok := v.Secrets[historyKey]
+	if !ok {
+		return defaultHistory
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return defaultHistory
+	}
+	return n
+}
+
+// record pushes a key's current state onto its history, newest first. A
+// key that does not exist yet is recorded as absent, so reverting to that
+// point takes it back out.
+func (v *vault) record(k string) {
+	n := v.keep()
+	if n == 0 || reserved[k] {
+		return
+	}
+	r := revision{At: nowUnix(), By: changedBy()}
+	if cur, ok := v.Secrets[k]; ok {
+		r.Val = cur
+	} else {
+		r.Gone = true
+	}
+	if v.History == nil {
+		v.History = map[string][]revision{}
+	}
+	h := append([]revision{r}, v.History[k]...)
+	if len(h) > n {
+		h = h[:n]
+	}
+	v.History[k] = h
+}
+
+// put sets a key, keeping the value it replaces. Rewriting the same value
+// is not a change and is not recorded.
+func (v *vault) put(k, val string) {
+	if cur, ok := v.Secrets[k]; ok && cur == val {
+		return
+	}
+	v.record(k)
+	v.Secrets[k] = val
+}
+
+// drop removes a key, keeping its last value so it can be brought back.
+func (v *vault) drop(k string) {
+	v.record(k)
+	delete(v.Secrets, k)
+}
+
+// changedBy labels a revision with who made it. Best effort: it is a
+// convenience for shared vaults, not an identity claim.
+func changedBy() string {
+	user := os.Getenv("USER")
+	host, _ := os.Hostname()
+	switch {
+	case user != "" && host != "":
+		return user + "@" + host
+	case user != "":
+		return user
+	}
+	return host
+}
+
+// nowUnix is replaced in tests.
+var nowUnix = func() int64 { return time.Now().Unix() }
 
 func (v *vault) keys() []string {
 	return sortedKeys(v.Secrets)
