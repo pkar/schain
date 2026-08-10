@@ -59,6 +59,8 @@ main checkout's vault at the same repo-relative path; SCHAIN_NO_WORKTREE=1
 turns that off.
 set and unset keep the value they replace (3 per key, never printed);
 "schain history off" stops that for a vault.
+a write is refused if the vault changed since it was opened, so two shells
+cannot drop each other's edits; SCHAIN_FORCE=1 writes anyway.
 inside a schain subshell, $SCHAIN_ACTIVE holds the chain, nearest last.`
 
 func main() {

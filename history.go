@@ -73,6 +73,9 @@ func historyShow(key string) error {
 		return err
 	}
 	defer v.close()
+	if v.rev > 0 {
+		fmt.Fprintf(os.Stderr, "%s, revision %d\n", display(path), v.rev)
+	}
 	if key != "" {
 		return showKey(v, key)
 	}

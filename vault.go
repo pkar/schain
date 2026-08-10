@@ -63,10 +63,13 @@ type vault struct {
 	key     []byte // derived; kept for re-encryption on save
 	Secrets map[string]string
 	History map[string][]revision // per key, newest first
+	rev     int                   // bumped per save; 0 under schain1
+	stamp   [32]byte              // the file as opened; zero means there was none
 }
 
 // envelope is the schain2 payload.
 type envelope struct {
+	Rev     int                   `json:"rev,omitempty"`
 	Secrets map[string]string     `json:"secrets"`
 	History map[string][]revision `json:"history,omitempty"`
 }
@@ -99,6 +102,7 @@ type vaultFile struct {
 	iters             int
 	salt, nonce, body []byte
 	hdr               []byte
+	sum               [32]byte // of the whole file, for change detection
 }
 
 func readVaultFile(path string) (*vaultFile, error) {
@@ -129,6 +133,7 @@ func readVaultFile(path string) (*vaultFile, error) {
 		nonce: blob[hdrLen : hdrLen+nonceLen],
 		body:  blob[hdrLen+nonceLen:],
 		hdr:   blob[:hdrLen],
+		sum:   sha256.Sum256(blob),
 	}, nil
 }
 
@@ -142,7 +147,7 @@ func decrypt(f *vaultFile, key []byte, path string) (*vault, error) {
 		wipe(key)
 		return nil, errBadPassphrase
 	}
-	v := &vault{iters: f.iters, salt: append([]byte(nil), f.salt...), key: key}
+	v := &vault{iters: f.iters, salt: append([]byte(nil), f.salt...), key: key, stamp: f.sum}
 	if f.magic == magic2 {
 		var env envelope
 		if err = json.Unmarshal(plain, &env); err == nil && env.Secrets == nil {
@@ -150,7 +155,7 @@ func decrypt(f *vaultFile, key []byte, path string) (*vault, error) {
 			// magic, so this means the file was built by hand.
 			err = errors.New("no secrets in envelope")
 		}
-		v.Secrets, v.History = env.Secrets, env.History
+		v.Secrets, v.History, v.rev = env.Secrets, env.History, env.Rev
 	} else {
 		if err = json.Unmarshal(plain, &v.Secrets); err == nil && v.Secrets == nil {
 			v.Secrets = map[string]string{}
@@ -190,14 +195,18 @@ func openVaultKey(path string, salt, key []byte) (*vault, error) {
 }
 
 func (v *vault) save(path string) error {
+	if err := v.checkUnchanged(path); err != nil {
+		return err
+	}
 	// Stay on the original format until there is history to store, so a
 	// vault that never keeps one is still readable by older builds.
 	m := magic
+	rev := v.rev + 1
 	var plain []byte
 	var err error
 	if len(v.History) > 0 {
 		m = magic2
-		plain, err = json.Marshal(envelope{Secrets: v.Secrets, History: v.History})
+		plain, err = json.Marshal(envelope{Rev: rev, Secrets: v.Secrets, History: v.History})
 	} else {
 		plain, err = json.Marshal(v.Secrets)
 	}
@@ -227,7 +236,61 @@ func (v *vault) save(path string) error {
 		os.Remove(tmp)
 		return err
 	}
+	// Only the envelope carries the counter, so a vault written in the old
+	// format reports 0 here too, matching what reopening it would give.
+	v.rev = 0
+	if m == magic2 {
+		v.rev = rev
+	}
+	v.stamp = sha256.Sum256(out)
 	return nil
+}
+
+// checkUnchanged refuses to overwrite a vault that changed since this one
+// was opened: two shells, or two worktrees, editing the same file would
+// otherwise silently drop one another's change. It narrows the window
+// rather than closing it, since another writer can still land between this
+// check and the rename below. SCHAIN_FORCE=1 writes regardless.
+func (v *vault) checkUnchanged(path string) error {
+	if os.Getenv("SCHAIN_FORCE") != "" {
+		return nil
+	}
+	fresh, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		if v.stamp == ([32]byte{}) {
+			return nil // creating it, as expected
+		}
+		return fmt.Errorf("%s was removed while it was open; nothing written\n(re-run to write it again, or SCHAIN_FORCE=1 to write this copy)", path)
+	}
+	if v.stamp == ([32]byte{}) {
+		return fmt.Errorf("%s appeared while this one was being created; nothing written\n(re-run to add your keys to it, or SCHAIN_FORCE=1 to replace it)", path)
+	}
+	if sha256.Sum256(fresh) == v.stamp {
+		return nil
+	}
+	return fmt.Errorf("%s changed on disk since it was opened%s; nothing written\n(re-run your command to apply it on top, or SCHAIN_FORCE=1 to overwrite)",
+		path, v.revNote(path))
+}
+
+// revNote names the revisions either side of a conflict when it can. It
+// needs the vault's own key, which fails if the other writer changed the
+// passphrase; then the plain message stands on its own.
+func (v *vault) revNote(path string) string {
+	if v.rev == 0 {
+		return ""
+	}
+	other, err := openVaultKey(path, v.salt, append([]byte(nil), v.key...))
+	if err != nil {
+		return ""
+	}
+	defer other.close()
+	if other.rev == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (revision %d, yours is %d)", other.rev, v.rev)
 }
 
 // rekey derives a fresh key from a new passphrase with a new salt.

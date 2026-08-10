@@ -153,6 +153,23 @@ Two things worth knowing before you rely on it:
 
 History belongs to one vault file, so these commands act on the nearest vault, never the merged chain.
 
+## Concurrent writes
+
+A vault is one file that several shells, and now several worktrees, can reach. schain refuses to overwrite a vault that changed since it opened it:
+
+```
+$ schain set API_TOKEN
+passphrase for ~/work: API_TOKEN:
+schain: /Users/you/work/.schain changed on disk since it was opened (revision 5, yours is 4); nothing written
+(re-run your command to apply it on top, or SCHAIN_FORCE=1 to overwrite)
+```
+
+Nothing is written and the other change stands, so re-running is always safe. The window that matters is between opening the vault and saving it, which includes any passphrase or value prompt, so it can be minutes wide.
+
+Vaults holding history carry a revision counter, bumped on every save, shown by `schain history` and named in the message above. Vaults without history have no counter, and are protected by comparing the file's contents instead, which also catches writes by schain older than 0.0.7. `SCHAIN_FORCE=1` writes anyway and drops whatever the other writer did.
+
+This narrows the window rather than closing it: schain takes no lock, so another writer can still land between the check and the rename.
+
 ## Git worktrees
 
 A linked worktree is a second checkout at another path. Vault files are untracked, so a fresh worktree has none of the repo's per-directory vaults, and every key that a child vault existed to override would quietly resolve to whatever an ancestor holds. schain closes that gap at lookup time: inside a linked worktree, a directory with no vault of its own uses the **main checkout's** vault at the same repo-relative path.
@@ -234,7 +251,7 @@ What it does not protect against: anything running as your user while secrets ar
 make test
 ```
 
-Covers roundtrip, wrong passphrase, per-byte tamper rejection, rekey, truncation, cache payload parsing, file permissions, chain composition (inherit, override, depth, prompt counts, caching, `set --here`, inherited `unset`, walk stops), bulk `--all` (recursive discovery, passphrase reuse, skipping vaults that will not open), and git worktrees (borrowing, local override, writes reaching the main checkout, submodules excluded, unreachable-ancestor warning, plus one test against a real `git worktree add`), and history (format round trip, cap and ordering, creation and deletion, revert including to-absent and undo-the-undo, off/purge returning the file to the old format, and that no value reaches stdout).
+Covers roundtrip, wrong passphrase, per-byte tamper rejection, rekey, truncation, cache payload parsing, file permissions, chain composition (inherit, override, depth, prompt counts, caching, `set --here`, inherited `unset`, walk stops), bulk `--all` (recursive discovery, passphrase reuse, skipping vaults that will not open), and git worktrees (borrowing, local override, writes reaching the main checkout, submodules excluded, unreachable-ancestor warning, plus one test against a real `git worktree add`), and history (format round trip, cap and ordering, creation and deletion, revert including to-absent and undo-the-undo, off/purge returning the file to the old format, and that no value reaches stdout), and concurrent writes (a stale copy is refused with both formats, the counter advances once per save, `SCHAIN_FORCE` overrides, and a vault that vanished or appeared underneath is not written).
 
 ## License
 
