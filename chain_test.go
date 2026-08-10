@@ -49,6 +49,10 @@ func mkVault(t *testing.T, dir, pass string, kv map[string]string) string {
 // unexpected prompt fails the test.
 func stubPrompt(t *testing.T, answers ...string) *int {
 	t.Helper()
+	// Whatever the developer running the tests has set: these tests are
+	// about the terminal path.
+	t.Setenv(envAskpass, "")
+	t.Setenv(envPassFile, "")
 	n := 0
 	old := promptSecret
 	promptSecret = func(prompt string) ([]byte, error) {
