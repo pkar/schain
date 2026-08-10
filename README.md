@@ -216,11 +216,62 @@ schain forget --all       # drop them for the same set
 `--all` adds a walk downward: every `.schain` under the current directory, plus the chain above it. Run it once at the top of a monorepo and every project underneath is prompt-free. A passphrase that opens one vault is tried on the rest before asking again, so a tree sharing one passphrase costs one prompt and a tree with three costs three. Vaults that will not open (wrong passphrase, unreadable, not a vault) are named on stderr and skipped, so one bad file does not abandon the run. The walk does not follow symlinks and does not descend into `.git`. The cache holds the derived key, never the passphrase, in:
 
 - macOS: the login keychain, via the system `security` tool. Unlocked at login, lives until `forget`.
-- Linux: the kernel keyring (`add_key(2)`). Never touches disk, gone on reboot.
+- Linux: the kernel user keyring (`add_key(2)`, `@u`). Never touches disk, gone on reboot.
+
+The Linux cache is scoped to your uid, not to your login session: a service started before you cached the key, a later `container exec`, and a fresh ssh login all see it. That is what makes `remember` useful for unattended work, and it is a real widening rather than a footnote: while a key is cached, **any process running as your uid can open that vault**, until `forget` or the TTL. schain says so in the key's permissions (`KEY_POS_ALL | KEY_USR_ALL`).
+
+Before 0.0.8 it left the `add_key` default, which grants the owning uid `view` and nothing else; reading, updating and searching all depended on possessing the session keyring the key was cached from. Same keyring, wrong permissions: the key was findable and unreadable from a service or a new login session. A key cached by 0.0.7 or older still belongs to that session, so `forget` and `remember` again after upgrading.
+
+Where the kernel keyring is not available at all, `remember` says so instead of failing obscurely. Container runtimes commonly block `add_key` and `keyctl` in their seccomp profile; there, use `SCHAIN_ASKPASS` below and skip the cache.
 
 `schain remember 30m` expires the cache after 30 minutes; durations take Go syntax (`30m`, `8h`, `1h30m`, `90s`), a bare number means minutes, and omitting it means no expiry. On Linux the kernel enforces the timeout. On macOS, which has no keychain TTL, schain embeds the expiry in the cached entry (an expired entry is never honored and is deleted on next use) and also spawns a detached sleeper that deletes the item on schedule; if the sleeper dies first (reboot), the embedded expiry still holds.
 
 The cached key is bound to the vault's salt, so `schain passwd` invalidates any cached copy. Tradeoff: while a key is cached, anything running as your user can decrypt that vault. `forget` when that bothers you.
+
+## No terminal to type at
+
+Containers, CI and launchd/systemd services have no tty. With nothing configured schain prompts, hits EOF, and exits non-zero, which is the right answer when a passphrase is missing and nobody is there. Point it at a program instead:
+
+```sh
+export SCHAIN_ASKPASS=/usr/local/bin/schain-askpass
+schain exec ./service < /dev/null      # no prompt, no tty
+```
+
+schain runs the helper once per vault and takes the first line of its stdout. Its arguments:
+
+```
+$1  the prompt, e.g. "passphrase for ~/work/app: "
+$2  the vault, absolute, e.g. "/work/app/.schain"
+$3  "open" for an existing vault, "new" for one being created or repassworded
+```
+
+`$2` is the part that matters. Passphrases are per vault, so `schain remember --all` over 66 vaults can be 66 different passphrases, and a helper that only knows one is no help. The prompt alone would not do either: it carries the shortened path (`~/work/app`), not the vault. A helper that answers per vault:
+
+```sh
+#!/bin/sh
+# argv: <prompt> <vault path> <open|new>
+exec cat "/run/secrets/schain/$(printf '%s' "$2" | sha256sum | cut -c1-16)"
+```
+
+Exit non-zero to give up on that vault: schain then fails the way a wrong passphrase does, and in a batch (`remember --all`) it names that vault on stderr and carries on with the rest. A helper that cannot be started at all is a broken setup, so that stops the run instead of repeating itself once per vault.
+
+When one passphrase really does cover everything, skip the program:
+
+```sh
+install -m 600 /dev/null /run/schain.pass
+printf 'correct horse battery staple\n' > /run/schain.pass
+export SCHAIN_PASSPHRASE_FILE=/run/schain.pass
+```
+
+First line of the file, and the file must be `0600` or tighter, the same rule ssh applies to a private key. With both set, `SCHAIN_ASKPASS` wins.
+
+Creating a vault this way asks once. The repeat prompt catches a typo at the keyboard; asking a program the same question twice proves nothing.
+
+Notes worth having in mind:
+
+- There is no `SCHAIN_PASSPHRASE` variable, deliberately. Every child of `schain exec` inherits the environment, and `/proc/<pid>/environ` hands it to anything running as you, which is precisely the set of processes that should not have it. The passphrase reaches schain over a pipe or a file and never through argv, so `ps` shows nothing.
+- Both mechanisms are opt-in and neither changes the interactive path. Configure nothing and schain behaves exactly as it always has, EOF failure included.
+- Secret *values* are still typed: `schain set KEY` prompts for the value on the terminal. Without one, pass `KEY=value` and mind your shell history.
 
 ## Why no shell hook
 
@@ -239,6 +290,7 @@ Built entirely on the Go standard library's crypto:
 - `schain exec` and the subshell use `execve`, replacing the schain process. No parent process holds decrypted secrets.
 - Iteration count below 100,000 in a vault file is refused (downgrade guard).
 - Key material is zeroed after use, best effort (Go's GC can copy memory).
+- Non-interactive input is opt-in and stays out of argv and the environment: a helper's answer arrives over a pipe, a passphrase file has to be `0600`, and there is no passphrase environment variable to inherit.
 - Replaced values are kept in the vault (see [History](#history)), so a value survives `unset` until it ages out or you `purge`. Everything stays inside the same encrypted file.
 
 Committing `.schain` to git: it is ciphertext, so it only exposes what any encrypted blob exposes (size, and it invites offline passphrase guessing). With a strong passphrase that is fine; with a weak one, add it to `.gitignore`.
@@ -251,7 +303,7 @@ What it does not protect against: anything running as your user while secrets ar
 make test
 ```
 
-Covers roundtrip, wrong passphrase, per-byte tamper rejection, rekey, truncation, cache payload parsing, file permissions, chain composition (inherit, override, depth, prompt counts, caching, `set --here`, inherited `unset`, walk stops), bulk `--all` (recursive discovery, passphrase reuse, skipping vaults that will not open), and git worktrees (borrowing, local override, writes reaching the main checkout, submodules excluded, unreachable-ancestor warning, plus one test against a real `git worktree add`), and history (format round trip, cap and ordering, creation and deletion, revert including to-absent and undo-the-undo, off/purge returning the file to the old format, and that no value reaches stdout), and concurrent writes (a stale copy is refused with both formats, the counter advances once per save, `SCHAIN_FORCE` overrides, and a vault that vanished or appeared underneath is not written).
+Covers roundtrip, wrong passphrase, per-byte tamper rejection, rekey, truncation, cache payload parsing, file permissions, chain composition (inherit, override, depth, prompt counts, caching, `set --here`, inherited `unset`, walk stops), bulk `--all` (recursive discovery, passphrase reuse, skipping vaults that will not open), and git worktrees (borrowing, local override, writes reaching the main checkout, submodules excluded, unreachable-ancestor warning, plus one test against a real `git worktree add`), and history (format round trip, cap and ordering, creation and deletion, revert including to-absent and undo-the-undo, off/purge returning the file to the old format, and that no value reaches stdout), and concurrent writes (a stale copy is refused with both formats, the counter advances once per save, `SCHAIN_FORCE` overrides, and a vault that vanished or appeared underneath is not written), and non-interactive input (the helper is asked once per vault and told which one, `remember --all` over vaults with different passphrases, a refusal skipping one vault while an unrunnable helper stops the run, creating a vault without a confirmation, a wrong answer not falling back to the terminal, passphrase files refused over their mode, output handling down to CRLF and a helper that never stops writing, and that with neither mechanism set the prompts are unchanged).
 
 ## License
 

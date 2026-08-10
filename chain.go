@@ -310,6 +310,19 @@ func unlockKnown(path string, known *[][]byte) (*vault, error) {
 	if v := openCached(path); v != nil {
 		return v, nil
 	}
+	// A configured passphrase source answers per vault, so there is
+	// nothing to reuse from other vaults and nothing to fall back to:
+	// what it says for this vault is the answer for this vault. That also
+	// keeps a run over vaults with distinct passphrases from re-deriving
+	// every earlier one before asking, which is quadratic in PBKDF2.
+	if passphraseSource() != "" {
+		p, err := askPassphrase(path, askOpen)
+		if err != nil {
+			return nil, err
+		}
+		defer wipe(p)
+		return openVault(path, p)
+	}
 	for i, p := range *known {
 		v, err := openVault(path, p)
 		if err == nil {

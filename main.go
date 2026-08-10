@@ -61,7 +61,22 @@ set and unset keep the value they replace (3 per key, never printed);
 "schain history off" stops that for a vault.
 a write is refused if the vault changed since it was opened, so two shells
 cannot drop each other's edits; SCHAIN_FORCE=1 writes anyway.
-inside a schain subshell, $SCHAIN_ACTIVE holds the chain, nearest last.`
+inside a schain subshell, $SCHAIN_ACTIVE holds the chain, nearest last.
+
+with no terminal to type at, a passphrase can come from elsewhere. both
+are off unless set, and with neither set schain prompts as it always has:
+  SCHAIN_ASKPASS=prog    preferred. runs prog per vault, argv is
+                         <prompt> <vault path> open|new, and takes the
+                         first line of its stdout. a non-zero exit gives
+                         up on that vault. being told the vault is what
+                         lets vaults with different passphrases work.
+  SCHAIN_PASSPHRASE_FILE=file
+                         first line of file, which must be mode 0600.
+                         one passphrase for every vault, so reach for
+                         SCHAIN_ASKPASS when they differ.
+there is no SCHAIN_PASSPHRASE: env vars are inherited by every child of
+"schain exec" and readable from /proc/<pid>/environ. secret values for
+"schain set KEY" are still typed; pass KEY=value without a terminal.`
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -177,7 +192,7 @@ func unlock(path string) (*vault, error) {
 	if v := openCached(path); v != nil {
 		return v, nil
 	}
-	pass, err := promptSecret(fmt.Sprintf("passphrase for %s: ", display(path)))
+	pass, err := askPassphrase(path, askOpen)
 	if err != nil {
 		return nil, err
 	}
@@ -186,12 +201,17 @@ func unlock(path string) (*vault, error) {
 }
 
 func newPassphrase(path string) ([]byte, error) {
-	p1, err := promptSecret(fmt.Sprintf("new passphrase for %s: ", display(path)))
+	p1, err := askPassphrase(path, askNew)
 	if err != nil {
 		return nil, err
 	}
 	if len(p1) == 0 {
 		return nil, fmt.Errorf("empty passphrase not allowed")
+	}
+	// The repeat catches a typo at the keyboard. Asking a program the
+	// same question twice proves nothing, so it is not asked.
+	if passphraseSource() != "" {
+		return p1, nil
 	}
 	p2, err := promptSecret("repeat: ")
 	if err != nil {
