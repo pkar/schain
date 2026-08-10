@@ -373,6 +373,178 @@ func TestHistorySwitchAndPurge(t *testing.T) {
 	}
 }
 
+// A vault that changed underneath is not overwritten.
+func TestSaveRefusesAfterExternalChange(t *testing.T) {
+	clock(t)
+	path := testVaultPath(t)
+	v, err := newVault([]byte("p"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.put("K", "mine")
+	if err := v.save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	mine := openAt(t, path, "p") // opened, then someone else writes
+	theirs := openAt(t, path, "p")
+	theirs.put("OTHER", "theirs")
+	if err := theirs.save(path); err != nil {
+		t.Fatal(err)
+	}
+	theirs.close()
+
+	mine.put("K", "clobber")
+	err = mine.save(path)
+	if err == nil {
+		t.Fatal("stale copy overwrote the file")
+	}
+	if !strings.Contains(err.Error(), "changed on disk") {
+		t.Errorf("unclear error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "revision") {
+		t.Errorf("error does not name the revisions: %v", err)
+	}
+	after := openAt(t, path, "p")
+	defer after.close()
+	if after.Secrets["OTHER"] != "theirs" || after.Secrets["K"] != "mine" {
+		t.Errorf("other writer's change was lost: %v", after.Secrets)
+	}
+
+	t.Setenv("SCHAIN_FORCE", "1")
+	if err := mine.save(path); err != nil {
+		t.Fatalf("SCHAIN_FORCE did not write: %v", err)
+	}
+	forced := openAt(t, path, "p")
+	defer forced.close()
+	if forced.Secrets["K"] != "clobber" {
+		t.Error("forced write did not land")
+	}
+	mine.close()
+}
+
+// The counter advances once per save and survives a round trip.
+func TestRevisionCounter(t *testing.T) {
+	clock(t)
+	path := testVaultPath(t)
+	v, err := newVault([]byte("p"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.put("K", "1")
+	if err := v.save(path); err != nil {
+		t.Fatal(err)
+	}
+	if v.rev != 1 {
+		t.Errorf("rev = %d, want 1", v.rev)
+	}
+	// The stamp is refreshed on write, so the same vault can save again.
+	v.put("K", "2")
+	if err := v.save(path); err != nil {
+		t.Fatal(err)
+	}
+	reopened := openAt(t, path, "p")
+	defer reopened.close()
+	if reopened.rev != 2 {
+		t.Errorf("rev = %d, want 2 after two saves", reopened.rev)
+	}
+}
+
+// A history-off vault stays on the old format, which carries no counter,
+// and is still protected by the content check.
+func TestConflictWithoutCounter(t *testing.T) {
+	clock(t)
+	path := testVaultPath(t)
+	v, err := newVault([]byte("p"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.Secrets[historyKey] = "0"
+	v.Secrets["K"] = "one"
+	if err := v.save(path); err != nil {
+		t.Fatal(err)
+	}
+	if v.rev != 0 {
+		t.Errorf("rev = %d, want 0 under the old format", v.rev)
+	}
+
+	mine := openAt(t, path, "p")
+	theirs := openAt(t, path, "p")
+	theirs.put("K", "theirs")
+	if err := theirs.save(path); err != nil {
+		t.Fatal(err)
+	}
+	theirs.close()
+	mine.put("K", "mine")
+	if err := mine.save(path); err == nil {
+		t.Fatal("stale copy overwrote a schain1 vault")
+	}
+	mine.close()
+}
+
+func TestSaveRefusesWhenVaultVanishesOrAppears(t *testing.T) {
+	clock(t)
+	path := testVaultPath(t)
+	v, err := newVault([]byte("p"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.put("K", "1")
+	if err := v.save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.save(path); err == nil {
+		t.Error("wrote a vault that had been removed")
+	}
+
+	fresh, err := newVault([]byte("q"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh.put("K", "new")
+	if err := fresh.save(path); err != nil {
+		t.Fatal(err) // nothing there: normal creation
+	}
+	other, err := newVault([]byte("r"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.put("K", "race")
+	if err := other.save(path); err == nil {
+		t.Error("replaced a vault that appeared underneath")
+	}
+}
+
+// The command path picks the check up: a vault opened before `set` ran
+// cannot write over it.
+func TestCommandWriteConflict(t *testing.T) {
+	clock(t)
+	d := tree(t, "a")
+	path := mkVault(t, d[0], "p", map[string]string{"K": "v1"})
+	stubCache(t, map[string]string{path: "p"})
+	stubPrompt(t)
+	captureStderr(t)
+	t.Chdir(d[0])
+
+	stale := openAt(t, path, "p")
+	if err := cmdSet([]string{"K=v2"}); err != nil {
+		t.Fatal(err)
+	}
+	stale.put("K", "v3")
+	if err := stale.save(path); err == nil {
+		t.Error("stale copy overwrote what set wrote")
+	}
+	stale.close()
+	v := openAt(t, path, "p")
+	defer v.close()
+	if v.Secrets["K"] != "v2" {
+		t.Errorf("K = %q, want v2", v.Secrets["K"])
+	}
+}
+
 // The listing shows metadata only: no value ever reaches stdout.
 func TestHistoryShowHidesValues(t *testing.T) {
 	clock(t)
