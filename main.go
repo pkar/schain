@@ -48,6 +48,8 @@ usage:
                            exec schain reload)
   schain worktree          show which vaults this git worktree uses and
                            which checkout each one lives in (alias: wt)
+  schain history [KEY]     what changed in the nearest vault, and when
+                           (revert/on/off/purge: schain history --help)
 
 first "schain set" creates ` + vaultName + ` in the current directory.
 ` + rootKey + ` set in a vault stops the walk there; SCHAIN_NO_INHERIT=1
@@ -55,6 +57,8 @@ disables inheritance entirely.
 in a linked git worktree, a directory with no vault of its own uses the
 main checkout's vault at the same repo-relative path; SCHAIN_NO_WORKTREE=1
 turns that off.
+set and unset keep the value they replace (3 per key, never printed);
+"schain history off" stops that for a vault.
 inside a schain subshell, $SCHAIN_ACTIVE holds the chain, nearest last.`
 
 func main() {
@@ -96,6 +100,8 @@ func run(args []string) error {
 		return cmdReload()
 	case "worktree", "wt":
 		return cmdWorktree(args[1:])
+	case "history":
+		return cmdHistory(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q (see schain --help)", args[0])
 	}
@@ -260,14 +266,14 @@ func cmdSet(args []string) error {
 	for _, arg := range args {
 		k, inline, hasInline := strings.Cut(arg, "=")
 		if hasInline {
-			v.Secrets[k] = inline
+			v.put(k, inline)
 			continue
 		}
 		val, err := promptSecret(k + ": ")
 		if err != nil {
 			return err
 		}
-		v.Secrets[k] = string(val)
+		v.put(k, string(val))
 		wipe(val)
 	}
 	if err := v.save(path); err != nil {
@@ -301,7 +307,7 @@ func cmdUnset(args []string) error {
 			}
 			return fmt.Errorf("no key %q", k)
 		}
-		delete(v.Secrets, k)
+		v.drop(k)
 	}
 	return v.save(path)
 }

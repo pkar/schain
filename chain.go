@@ -14,8 +14,11 @@ import (
 // salt and passphrase; composition happens in memory after decryption.
 
 // rootKey, present and non-empty in a vault, stops the upward walk there.
-// It is never exported to the environment.
 const rootKey = "SCHAIN_ROOT"
+
+// reserved keys configure a vault instead of being part of its
+// environment: they are never exported and never get a history entry.
+var reserved = map[string]bool{rootKey: true, historyKey: true}
 
 // Indirection points for tests.
 var (
@@ -374,7 +377,9 @@ func (c *chain) secrets() map[string]string {
 			out[k] = val
 		}
 	}
-	delete(out, rootKey)
+	for k := range reserved {
+		delete(out, k)
+	}
 	return out
 }
 
