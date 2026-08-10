@@ -9,15 +9,28 @@ import (
 // Linux: kernel user keyring via add_key(2)/keyctl(2). No daemon, no
 // libsecret. Keys are held by the kernel, never touch disk, and vanish
 // on reboot (or earlier with a TTL, or via `schain forget`).
+//
+// The user keyring is per uid and outlives any one login session, which
+// is what a service or a second `container exec` needs. Reaching it is
+// only half the job: see keyPerm.
 
 const (
 	keySpecUserKeyring = ^uintptr(3) // KEY_SPEC_USER_KEYRING (-4)
 
-	keyctlUpdate     = 2
+	keyctlSetPerm    = 5
 	keyctlUnlink     = 9
 	keyctlSearch     = 10
 	keyctlRead       = 11
 	keyctlSetTimeout = 15
+
+	// KEY_POS_ALL | KEY_USR_ALL. add_key grants the owning uid
+	// KEY_USR_VIEW and nothing else: reading, updating and searching all
+	// ride on possession, and possession comes from the session keyring.
+	// A key cached in one session is then findable and unreadable from
+	// the next, which is exactly the unattended case `remember` exists
+	// for. Widening it to the uid means any process running as this user
+	// can open the vault until `schain forget`.
+	keyPerm = 0x3f3f0000
 )
 
 func keyDesc(vaultPath string) string { return "schain:" + vaultPath }
@@ -36,16 +49,35 @@ func cacheStore(vaultPath string, payload []byte, ttlSeconds int) error {
 		uintptr(unsafe.Pointer(&payload[0])), uintptr(len(payload)),
 		keySpecUserKeyring, 0)
 	if errno != 0 {
-		return fmt.Errorf("add_key: %v", errno)
+		return keyringErr("add_key", errno)
+	}
+	if _, _, errno := syscall.Syscall6(syscall.SYS_KEYCTL,
+		keyctlSetPerm, id, keyPerm, 0, 0, 0); errno != 0 {
+		return keyringErr("keyctl setperm", errno)
 	}
 	if ttlSeconds > 0 {
 		_, _, errno = syscall.Syscall6(syscall.SYS_KEYCTL,
 			keyctlSetTimeout, id, uintptr(ttlSeconds), 0, 0, 0)
 		if errno != 0 {
-			return fmt.Errorf("keyctl set_timeout: %v", errno)
+			return keyringErr("keyctl set_timeout", errno)
 		}
 	}
 	return nil
+}
+
+// keyringErr names the failures worth explaining: a sandbox that blocks
+// the syscalls outright, a keyring cached by a schain that predates the
+// permission widening above, and a full quota.
+func keyringErr(op string, errno syscall.Errno) error {
+	switch errno {
+	case syscall.EPERM, syscall.ENOSYS:
+		return fmt.Errorf("%s: %v (no kernel keyring here; container runtimes commonly block add_key and keyctl, so `remember` cannot cache anything)", op, errno)
+	case syscall.EACCES:
+		return fmt.Errorf("%s: %v (a key cached by schain 0.0.7 or older can only be used from the session that cached it; `schain forget` there, then remember again)", op, errno)
+	case syscall.EDQUOT:
+		return fmt.Errorf("%s: %v (keyring quota is full; see /proc/sys/kernel/keys/maxkeys)", op, errno)
+	}
+	return fmt.Errorf("%s: %v", op, errno)
 }
 
 func searchKey(vaultPath string) (uintptr, error) {
@@ -88,7 +120,7 @@ func cacheForget(vaultPath string) error {
 	_, _, errno := syscall.Syscall6(syscall.SYS_KEYCTL,
 		keyctlUnlink, id, keySpecUserKeyring, 0, 0, 0)
 	if errno != 0 {
-		return fmt.Errorf("keyctl unlink: %v", errno)
+		return keyringErr("keyctl unlink", errno)
 	}
 	return nil
 }
