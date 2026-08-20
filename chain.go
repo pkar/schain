@@ -6,7 +6,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 )
 
 // A chain is every vault from cwd up to the root, merged nearest-wins, so
@@ -348,32 +350,177 @@ func unlockKnown(path string, known *[][]byte) (*vault, error) {
 	return v, nil
 }
 
-// eachVault opens the given vaults one at a time, hands each to fn, and
-// closes it again. A vault that will not open is counted as skipped, so
-// one bad passphrase does not abandon the rest; only a dead prompt stops
-// the run.
+// eachVault opens the given vaults, hands each to fn, and closes it
+// again. Vaults have nothing to do with one another, so this works on
+// several at once and fn must be safe to call from several goroutines.
+// Deriving one key is 600k rounds of PBKDF2, and on macOS every cache
+// write is a separate `security` process, so a run over a few dozen
+// vaults spends nearly all its time in work that parallelises.
+//
+// Each pass tries one thing against every vault still shut: first the
+// keys already in the OS store, then each passphrase as it is learned. A
+// pass only has to try the newest passphrase, since the ones before it
+// have already failed on everything still shut. The prompt is the serial
+// part, and it asks about the first vault still shut, which is the order
+// schain has always asked in.
+//
+// A vault that will not open is counted as skipped, so one bad
+// passphrase does not abandon the rest; only a dead prompt stops the run.
 func eachVault(paths []string, fn func(string, *vault) error) (done int, skipped []string, err error) {
+	r := &vaultRun{fn: fn}
+
+	// Whatever `remember` already cached: no passphrase, no derivation,
+	// and on a re-run it is the whole job.
+	left := r.pass(paths, func(p string) (*vault, error) {
+		if v := openCached(p); v != nil {
+			return v, nil
+		}
+		return nil, errBadPassphrase
+	})
+
+	// A configured source answers per vault, so there is nothing to carry
+	// from one vault to the next. One pass asks about all of them, and
+	// asking twice would only get the same answer.
+	if passphraseSource() != "" {
+		left = r.pass(left, func(p string) (*vault, error) {
+			pass, err := askPassphrase(p, askOpen)
+			if err != nil {
+				return nil, err
+			}
+			defer wipe(pass)
+			return openVault(p, pass)
+		})
+		if r.err == nil {
+			for _, p := range left {
+				r.skip(p, errBadPassphrase)
+			}
+		}
+		return r.done, r.skipped, r.err
+	}
+
+	// Typed: ask about the first vault still shut, then try that answer
+	// against every one of them at once. Neighbouring vaults tend to
+	// share a passphrase, so one answer usually opens the rest in a
+	// single pass.
 	var known [][]byte
 	defer func() { wipeAll(known) }()
-	for _, p := range paths {
-		v, err := unlockKnown(p, &known)
+	for len(left) > 0 && r.err == nil {
+		asked := left[0]
+		pass, err := promptSecret(fmt.Sprintf("passphrase for %s: ", display(asked)))
 		if err != nil {
-			var ae abortErr
-			if errors.As(err, &ae) {
-				return done, skipped, err
-			}
-			skipped = append(skipped, p)
-			fmt.Fprintf(os.Stderr, "schain: skipping %s: %v\n", p, err)
-			continue
+			return r.done, r.skipped, abortErr{err}
 		}
-		err = fn(p, v)
-		v.close()
-		if err != nil {
-			return done, skipped, err
+		known = append(known, pass)
+		left = r.pass(left, func(p string) (*vault, error) {
+			return openVault(p, pass)
+		})
+		if r.err != nil {
+			break
 		}
-		done++
+		if len(left) > 0 && left[0] == asked {
+			// It did not fit the vault it was asked about, and asking
+			// again would be the same question.
+			r.skip(asked, errBadPassphrase)
+			left = left[1:]
+		}
 	}
-	return done, skipped, nil
+	return r.done, r.skipped, r.err
+}
+
+// vaultRun is what a sequence of passes over the vaults added up to.
+// Nothing here is touched from a worker: the passes hand back their
+// results in path order and this is filled in from that, so what schain
+// counts and prints does not depend on which vault finished first.
+type vaultRun struct {
+	fn      func(string, *vault) error
+	done    int
+	skipped []string
+	err     error
+}
+
+// vaultResult is one worker's outcome: why the vault stayed shut, or
+// what fn made of it once it opened.
+type vaultResult struct {
+	openErr error
+	fnErr   error
+}
+
+// pass opens every path with open, on every core, and hands what opens to
+// fn. It returns the paths whose passphrase open did not have, in their
+// original order, for the next pass to try.
+func (r *vaultRun) pass(paths []string, open func(string) (*vault, error)) []string {
+	if r.err != nil || len(paths) == 0 {
+		return paths
+	}
+	res := forEach(paths, func(p string) vaultResult {
+		v, err := open(p)
+		if err != nil {
+			return vaultResult{openErr: err}
+		}
+		err = r.fn(p, v)
+		v.close()
+		return vaultResult{fnErr: err}
+	})
+	var left []string
+	for i, p := range paths {
+		switch {
+		case res[i].openErr == errBadPassphrase:
+			left = append(left, p)
+		case res[i].openErr != nil:
+			r.skip(p, res[i].openErr)
+		case res[i].fnErr != nil:
+			if r.err == nil {
+				r.err = res[i].fnErr
+			}
+		default:
+			r.done++
+		}
+	}
+	return left
+}
+
+// skip records a vault that would not open. A failure no vault could get
+// past (no terminal, an unrunnable helper) ends the run instead, since
+// every other vault would fail the same way.
+func (r *vaultRun) skip(path string, err error) {
+	var ae abortErr
+	if errors.As(err, &ae) {
+		if r.err == nil {
+			r.err = err
+		}
+		return
+	}
+	r.skipped = append(r.skipped, path)
+	fmt.Fprintf(os.Stderr, "schain: skipping %s: %v\n", path, err)
+}
+
+// forEach runs fn over items on several goroutines and returns the
+// results in the order the items came in.
+func forEach[T, R any](items []T, fn func(T) R) []R {
+	out := make([]R, len(items))
+	sem := make(chan struct{}, vaultWorkers())
+	var wg sync.WaitGroup
+	for i, it := range items {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			out[i] = fn(it)
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
+// vaultWorkers bounds how many vaults are worked on at once. PBKDF2 is
+// CPU bound, so one per core is the whole win there; the process spawns
+// macOS needs for its keychain overlap happily at the same width.
+func vaultWorkers() int {
+	if n := runtime.GOMAXPROCS(0); n > 1 {
+		return n
+	}
+	return 1
 }
 
 func wipeAll(bs [][]byte) {
