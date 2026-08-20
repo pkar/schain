@@ -80,22 +80,30 @@ func TestAskpassRememberAllDistinctPassphrases(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("helper called %d time(s), want 3: %v", len(got), got)
 	}
-	for i, want := range []string{top, mid, leaf} {
-		fields := strings.Split(got[i], "|")
+	// Vaults are worked on at the same time, so which call landed first
+	// is not part of the contract. Which vault each one is about is.
+	asked := map[string]bool{}
+	for i, call := range got {
+		fields := strings.Split(call, "|")
 		if len(fields) != 3 {
-			t.Fatalf("call %d = %q, want prompt|path|action", i, got[i])
+			t.Fatalf("call %d = %q, want prompt|path|action", i, call)
 		}
-		if fields[1] != want {
-			t.Errorf("call %d asked about %q, want %q", i, fields[1], want)
-		}
+		asked[fields[1]] = true
 		if fields[2] != askOpen {
 			t.Errorf("call %d action = %q, want %q", i, fields[2], askOpen)
 		}
 		if !strings.HasPrefix(fields[0], "passphrase for ") {
 			t.Errorf("call %d prompt = %q", i, fields[0])
 		}
-		if strings.Contains(got[i], "one") && want != top {
-			t.Errorf("call %d argv leaked a passphrase: %q", i, got[i])
+		for _, pass := range []string{"one", "two", "three"} {
+			if strings.Contains(call, "|"+pass) || strings.HasSuffix(call, pass) {
+				t.Errorf("call %d argv leaked a passphrase: %q", i, call)
+			}
+		}
+	}
+	for _, want := range []string{top, mid, leaf} {
+		if !asked[want] {
+			t.Errorf("helper was never asked about %s: %v", want, got)
 		}
 	}
 }

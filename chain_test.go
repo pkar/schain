@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -360,16 +361,23 @@ func TestReloadChainOrder(t *testing.T) {
 	wantSecrets(t, c.secrets(), map[string]string{"S": "child", "A": "1"})
 }
 
-// stubStore records what --all cached, keyed by vault path.
+// stubStore records what --all cached, keyed by vault path. --all works
+// on several vaults at once, so the map is locked; the test reads it
+// after the command has returned.
 func stubStore(t *testing.T) map[string]int {
 	t.Helper()
 	stored := map[string]int{}
+	var mu sync.Mutex
 	oldStore, oldForget := storeCache, forgetCache
 	storeCache = func(path string, payload []byte, ttl int) error {
+		mu.Lock()
+		defer mu.Unlock()
 		stored[path] = ttl
 		return nil
 	}
 	forgetCache = func(path string) error {
+		mu.Lock()
+		defer mu.Unlock()
 		if _, ok := stored[path]; !ok {
 			return errNoCache
 		}
@@ -454,6 +462,39 @@ func TestRememberAllIncludesAncestors(t *testing.T) {
 	}
 	if _, ok := stored[leaf]; !ok {
 		t.Error("descendant vault not cached")
+	}
+}
+
+// One answer is tried against every vault still shut, not just the next
+// one down, so vaults sharing a passphrase cost one prompt between them
+// however they are scattered through the tree.
+func TestRememberAllAsksOncePerPassphrase(t *testing.T) {
+	d := tree(t, "a", "a/b", "a/b/c")
+	var want []string
+	for i, dir := range d {
+		pass := "shared"
+		if i == 1 {
+			pass = "odd"
+		}
+		want = append(want, mkVault(t, dir, pass, map[string]string{"K": "v"}))
+	}
+	stubCache(t, nil)
+	stored := stubStore(t)
+	// Root first, then the odd one out; the two below it never ask.
+	n := stubPrompt(t, "shared", "odd")
+	captureStderr(t)
+	t.Chdir(d[0])
+
+	if err := cmdRemember([]string{"--all"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range want {
+		if _, ok := stored[p]; !ok {
+			t.Errorf("%s not cached", p)
+		}
+	}
+	if *n != 2 {
+		t.Errorf("prompts = %d, want 2 (one per distinct passphrase)", *n)
 	}
 }
 

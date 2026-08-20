@@ -566,14 +566,16 @@ func cmdForget(args []string) error {
 			paths = paths[:1]
 		}
 	}
+	// --all can be hundreds of vaults, and on macOS each one is its own
+	// `security` process, so they go at once.
 	n := 0
-	for _, p := range paths {
-		if forgetCache(p) != nil {
+	for i, gone := range forEach(paths, func(p string) bool { return forgetCache(p) == nil }) {
+		if !gone {
 			continue
 		}
 		n++
 		if scope != scopeAll {
-			fmt.Fprintf(os.Stderr, "schain: forgot cached key for %s\n", display(p))
+			fmt.Fprintf(os.Stderr, "schain: forgot cached key for %s\n", display(paths[i]))
 		}
 	}
 	if scope == scopeAll {
