@@ -69,6 +69,7 @@ Other commands:
 schain ls           # list key names
 schain ls --local   # only the nearest vault's keys
 schain unset KEY    # removes from the nearest vault
+schain set --expand KEY='${SCHAIN_DIR}/f'   # value resolved on the way out
 schain passwd       # change passphrase (rotates salt)
 schain reload       # refresh a schain shell's env (automatic in bash/zsh/fish)
 schain worktree     # which vaults a git worktree uses, and from where
@@ -114,6 +115,48 @@ Stopping the walk:
 - `SCHAIN_NO_INHERIT=1` in the environment turns inheritance off entirely, nearest vault only.
 
 A child can override an inherited key but cannot remove one; an empty value means an empty value, not "unset". Unset it in the vault that defines it (`schain ls -v` names that vault).
+
+## Paths that follow the vault
+
+Values are stored literally and handed to a child literally. There is one exception, and you ask for it per key:
+
+```sh
+$ schain set --expand KUBECONFIG='${SCHAIN_DIR}/kube.yaml'
+```
+
+`${SCHAIN_DIR}` is the directory of the vault that defines the key. It is resolved every time the value is injected, and the stored value never changes:
+
+```sh
+$ schain ls -v
+KUBECONFIG  ~/work/repo/prod  expands ${SCHAIN_DIR}
+$ schain exec sh -c 'echo $KUBECONFIG'
+/Users/you/work/repo/prod/kube.yaml
+```
+
+Three names mean anything, and braces are required:
+
+- `${SCHAIN_DIR}` the directory of the vault the key is defined in
+- `${HOME}` your home directory
+- `${USER}` your login name
+
+`${SCHAIN_DIR}` is the point of the feature. A path with `$HOME` in it survives moving between machines and is still wrong between two checkouts of one repo, which is how a worktree ends up reading the main checkout's kubeconfig. `${SCHAIN_DIR}` follows the vault, so a checkout with its own vault gets its own paths. It means the vault's directory rather than the current one, so a key defined three levels up expands to that level wherever you run from; bound to the current directory it would just be relative paths with extra steps.
+
+In a linked git worktree the borrowed vault lives in the main checkout, and `${SCHAIN_DIR}` is the directory in **this** checkout that borrowed it. One vault file, and each worktree gets its own path out of it.
+
+### Why it is opt-in
+
+A store built to hold secrets cannot expand every value that looks like it has a variable in it. A bcrypt hash starts `$2y$05$`, and the usual expander reads that as three variables named `2y`, `05` and whatever follows. None of them are set, so what comes back is a hash with holes in it, no error, and the first symptom is a 401 from a registry weeks later.
+
+So: nothing expands unless the key is marked, a bare `$` never starts a reference, and a name outside those three is left exactly as written. `$2y$05$...` is never a candidate, in a marked key or any other.
+
+Two more edges:
+
+- `schain set --expand K=${PWD}/x` is refused at the keyboard, naming what schain does expand. A typo is a complaint now instead of a `${PWD}` found in production later.
+- A name schain does expand that resolves to nothing stops the command, naming the key and the vault. `${HOME}/kube.yaml` turning into `/kube.yaml` is not a better outcome than failing.
+
+The mark belongs to the key, not to the one command that set it, so a later `schain set KUBECONFIG=...` keeps expanding rather than silently going literal. `schain set --no-expand KEY=...` takes it back, and `schain unset KEY` takes it with the key.
+
+The list of expanded keys lives in a reserved `SCHAIN_EXPAND` key inside the vault, so this needs no change to the file format and it is never exported. An older schain opens such a vault fine and exports the value with the `${...}` still in it, which is wrong in a way you can see.
 
 ## History
 
@@ -191,6 +234,7 @@ The rest of the rules:
 
 - **A vault in the worktree wins.** `schain set --here KEY` creates one, for a worktree that should deliberately differ.
 - **Writes go to the main checkout.** `set`, `unset`, and `passwd` acting on a borrowed vault change that one file, so a rotation from a worktree is visible everywhere at once. schain names the file on stderr when it does this.
+- **`${SCHAIN_DIR}` points here, not there.** A key expanded out of a borrowed vault resolves to the directory in this checkout, so one vault file gives each worktree its own paths (see [Paths that follow the vault](#paths-that-follow-the-vault)).
 - **A worktree outside the vault root gets a warning**, naming the vaults the main checkout composes with that this worktree cannot reach.
 - Detection reads git's own files (`.git` → `commondir`), so no `git` binary is needed. Submodules use the same `.git` indirection but have no `commondir`, so they never borrow. `SCHAIN_NO_WORKTREE=1` turns the whole thing off.
 
@@ -296,6 +340,7 @@ Built entirely on the Go standard library's crypto:
 - Key material is zeroed after use, best effort (Go's GC can copy memory).
 - Non-interactive input is opt-in and stays out of argv and the environment: a helper's answer arrives over a pipe, a passphrase file has to be `0600`, and there is no passphrase environment variable to inherit.
 - Replaced values are kept in the vault (see [History](#history)), so a value survives `unset` until it ages out or you `purge`. Everything stays inside the same encrypted file.
+- Values are never rewritten on the way out unless a key opts in, and then only for three names inside braces. Expanding whatever looked like a variable would corrupt the secrets a vault exists to hold, quietly (see [Why it is opt-in](#why-it-is-opt-in)).
 
 Committing `.schain` to git: it is ciphertext, so it only exposes what any encrypted blob exposes (size, and it invites offline passphrase guessing). With a strong passphrase that is fine; with a weak one, add it to `.gitignore`.
 
@@ -307,7 +352,7 @@ What it does not protect against: anything running as your user while secrets ar
 make test
 ```
 
-Covers roundtrip, wrong passphrase, per-byte tamper rejection, rekey, truncation, cache payload parsing, file permissions, chain composition (inherit, override, depth, prompt counts, caching, `set --here`, inherited `unset`, walk stops), bulk `--all` (recursive discovery, passphrase reuse across scattered vaults, skipping vaults that will not open), and git worktrees (borrowing, local override, writes reaching the main checkout, submodules excluded, unreachable-ancestor warning, plus one test against a real `git worktree add`), and history (format round trip, cap and ordering, creation and deletion, revert including to-absent and undo-the-undo, off/purge returning the file to the old format, and that no value reaches stdout), and concurrent writes (a stale copy is refused with both formats, the counter advances once per save, `SCHAIN_FORCE` overrides, and a vault that vanished or appeared underneath is not written), and non-interactive input (the helper is asked once per vault and told which one, `remember --all` over vaults with different passphrases, a refusal skipping one vault while an unrunnable helper stops the run, creating a vault without a confirmation, a wrong answer not falling back to the terminal, passphrase files refused over their mode, output handling down to CRLF and a helper that never stops writing, and that with neither mechanism set the prompts are unchanged).
+Covers roundtrip, wrong passphrase, per-byte tamper rejection, rekey, truncation, cache payload parsing, file permissions, chain composition (inherit, override, depth, prompt counts, caching, `set --here`, inherited `unset`, walk stops), bulk `--all` (recursive discovery, passphrase reuse across scattered vaults, skipping vaults that will not open), and git worktrees (borrowing, local override, writes reaching the main checkout, submodules excluded, unreachable-ancestor warning, plus one test against a real `git worktree add`), and history (format round trip, cap and ordering, creation and deletion, revert including to-absent and undo-the-undo, off/purge returning the file to the old format, and that no value reaches stdout), and concurrent writes (a stale copy is refused with both formats, the counter advances once per save, `SCHAIN_FORCE` overrides, and a vault that vanished or appeared underneath is not written), and non-interactive input (the helper is asked once per vault and told which one, `remember --all` over vaults with different passphrases, a refusal skipping one vault while an unrunnable helper stops the run, creating a vault without a confirmation, a wrong answer not falling back to the terminal, passphrase files refused over their mode, output handling down to CRLF and a helper that never stops writing, and that with neither mechanism set the prompts are unchanged), and value expansion (bare dollars and unknown names left alone, the defining vault's directory rather than the nearest or the current one, a borrowed vault resolving into the worktree, opt-in refused for names schain does not expand, the mark surviving a later plain `set`, and `unset` clearing it).
 
 ## License
 

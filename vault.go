@@ -371,8 +371,12 @@ func (v *vault) put(k, val string) {
 }
 
 // drop removes a key, keeping its last value so it can be brought back.
+// Whether it was expanded goes with it: a key that is not there has no
+// business in the expand list, and setting it again would otherwise
+// inherit a decision made before it was removed.
 func (v *vault) drop(k string) {
 	v.record(k)
+	v.setExpand(k, false)
 	delete(v.Secrets, k)
 }
 
