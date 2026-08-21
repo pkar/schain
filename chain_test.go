@@ -117,17 +117,17 @@ func captureStdout(t *testing.T) func() string {
 }
 
 func TestPrintKeys(t *testing.T) {
-	src := func(k string) string {
+	src := func(k string) (string, string) {
 		if k == "A" {
-			return display("/tmp/parent/.schain")
+			return display("/tmp/parent/.schain"), ""
 		}
-		return display("/tmp/parent/child/.schain")
+		return display("/tmp/parent/child/.schain"), "expands ${SCHAIN_DIR}"
 	}
 	keys := []string{"A", "LONGER"}
 
 	out := captureStdout(t)
 	printKeys(keys, src, true, false)
-	if got, want := out(), "A       /tmp/parent\nLONGER  /tmp/parent/child\n"; got != want {
+	if got, want := out(), "A       /tmp/parent\nLONGER  /tmp/parent/child  expands ${SCHAIN_DIR}\n"; got != want {
 		t.Errorf("annotated output = %q, want %q", got, want)
 	}
 

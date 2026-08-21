@@ -31,6 +31,9 @@ usage:
   schain set KEY=value     store secret inline (lands in shell history!)
   schain set --here KEY    store in a vault in this directory, creating
                            it even when a parent vault exists
+  schain set --expand KEY  resolve ${SCHAIN_DIR}, ${HOME} or ${USER} in
+                           this key's value every time it is injected
+                           (--no-expand goes back to a literal value)
   schain unset KEY...      remove keys from the nearest vault
   schain ls [--local] [-v] list key names; on a terminal each key is
                            tagged with the vault it comes from (-v forces
@@ -59,6 +62,12 @@ main checkout's vault at the same repo-relative path; SCHAIN_NO_WORKTREE=1
 turns that off.
 set and unset keep the value they replace (3 per key, never printed);
 "schain history off" stops that for a vault.
+values are stored and injected literally unless "set --expand" says
+otherwise for a key. then, and only then, ${SCHAIN_DIR} (the directory of
+the vault defining the key), ${HOME} and ${USER} are substituted on the
+way into a child; braces are required and no other name means anything,
+so a value like $2y$05$... is never touched. "schain ls -v" marks the
+keys whose stored value is not what a child sees.
 a write is refused if the vault changed since it was opened, so two shells
 cannot drop each other's edits; SCHAIN_FORCE=1 writes anyway.
 inside a schain subshell, $SCHAIN_ACTIVE holds the chain, nearest last.
@@ -225,23 +234,53 @@ func newPassphrase(path string) ([]byte, error) {
 	return p1, nil
 }
 
+const setUsage = "usage: schain set [--here] [--expand|--no-expand] KEY... | KEY=value..."
+
 func cmdSet(args []string) error {
-	here := false
-	if len(args) > 0 && (args[0] == "--here" || args[0] == "--local") {
-		here, args = true, args[1:]
+	here, expand, literal := false, false, false
+	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
+		switch args[0] {
+		case "--here", "--local":
+			here = true
+		case "--expand":
+			expand = true
+		case "--no-expand":
+			literal = true
+		default:
+			return fmt.Errorf("%s", setUsage)
+		}
+		args = args[1:]
+	}
+	if expand && literal {
+		return fmt.Errorf("--expand and --no-expand contradict each other")
 	}
 	if len(args) == 0 {
-		return fmt.Errorf("usage: schain set [--here] KEY... | KEY=value...")
+		return fmt.Errorf("%s", setUsage)
 	}
 	// Vet every key before unlocking anything, so a typo cannot come to
-	// light halfway through a run of prompts.
+	// light halfway through a run of prompts. Values given inline are
+	// vetted here too; the ones still to be typed have to wait.
 	for _, arg := range args {
-		k, _, _ := strings.Cut(arg, "=")
+		k, inline, hasInline := strings.Cut(arg, "=")
 		if k == "" || strings.ContainsAny(k, "\x00") {
 			return fmt.Errorf("invalid key %q", arg)
 		}
 		if strings.HasPrefix(k, "-") {
 			return fmt.Errorf("invalid key %q (flags must come before keys)", k)
+		}
+		if !expand {
+			continue
+		}
+		if reserved[k] {
+			return fmt.Errorf("%s configures the vault and is never exported; --expand would do nothing", k)
+		}
+		if strings.Contains(k, ",") {
+			return fmt.Errorf("cannot --expand %q: the list of expanded keys is comma-separated", k)
+		}
+		if hasInline {
+			if err := checkExpand(k, inline); err != nil {
+				return err
+			}
 		}
 	}
 	path, err := findVault()
@@ -286,17 +325,27 @@ func cmdSet(args []string) error {
 	}
 	defer v.close()
 	for _, arg := range args {
-		k, inline, hasInline := strings.Cut(arg, "=")
-		if hasInline {
-			v.put(k, inline)
-			continue
+		k, val, hasInline := strings.Cut(arg, "=")
+		if !hasInline {
+			typed, err := promptSecret(k + ": ")
+			if err != nil {
+				return err
+			}
+			val = string(typed)
+			wipe(typed)
+			if expand {
+				if err := checkExpand(k, val); err != nil {
+					return err
+				}
+			}
 		}
-		val, err := promptSecret(k + ": ")
-		if err != nil {
-			return err
+		v.put(k, val)
+		// Expansion is a property of the key, so it survives later writes
+		// to it: "set K=..." on an expanded key would otherwise turn it
+		// literal without saying so, and the path would quietly go wrong.
+		if expand || literal {
+			v.setExpand(k, expand)
 		}
-		v.put(k, string(val))
-		wipe(val)
 	}
 	if err := v.save(path); err != nil {
 		return err
@@ -358,7 +407,7 @@ func cmdLs(args []string) error {
 			return err
 		}
 		defer v.close()
-		label := func(string) string { return display(path) }
+		label := func(k string) (string, string) { return display(path), expandNote(v, k) }
 		return printKeys(v.keys(), label, verbose, plain)
 	}
 	c, err := openChain()
@@ -378,17 +427,19 @@ func cmdLs(args []string) error {
 	if err != nil {
 		return err
 	}
-	label := func(k string) string {
-		p := c.sourceOf(k)
-		if borrowed[p] {
-			return display(p) + " (main checkout)"
+	label := func(k string) (string, string) {
+		def, p := c.definerOf(k)
+		if borrowed[p] != "" {
+			return display(p) + " (main checkout)", expandNote(def, k)
 		}
-		return display(p)
+		return display(p), expandNote(def, k)
 	}
 	return printKeys(sortedKeys(secrets), label, verbose, plain)
 }
 
-func printKeys(keys []string, label func(string) string, verbose, plain bool) error {
+// printKeys lists keys, and with -v the vault each comes from plus a note
+// for anything about that key a plain listing would hide.
+func printKeys(keys []string, label func(string) (string, string), verbose, plain bool) error {
 	if plain || !verbose {
 		for _, k := range keys {
 			fmt.Println(k)
@@ -397,7 +448,12 @@ func printKeys(keys []string, label func(string) string, verbose, plain bool) er
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	for _, k := range keys {
-		fmt.Fprintf(w, "%s\t%s\n", k, label(k))
+		src, note := label(k)
+		if note == "" {
+			fmt.Fprintf(w, "%s\t%s\n", k, src)
+			continue
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\n", k, src, note)
 	}
 	return w.Flush()
 }
@@ -634,8 +690,12 @@ func enterShell(c *chain) error {
 		shell = currentShell()
 	}
 	_, near := c.nearest()
+	secrets, err := c.env()
+	if err != nil {
+		c.close()
+		return err
+	}
 	setMarker(display(near))
-	secrets := c.secrets()
 	argv, env := subshellLaunch(shell, secretEnviron(secrets, c.paths, shell))
 	fmt.Fprintf(os.Stderr, "schain: entering shell with env from %s (%d keys), exit to leave\n",
 		chainLabel(c), len(secrets))
@@ -721,9 +781,14 @@ func cmdExec(cmdline []string) error {
 	}
 	bin, err := exec.LookPath(cmdline[0])
 	if err != nil {
+		c.close()
 		return err
 	}
-	secrets := c.secrets()
+	secrets, err := c.env()
+	if err != nil {
+		c.close()
+		return err
+	}
 	env := secretEnviron(secrets, c.paths, "")
 	wipeMap(secrets)
 	c.close()

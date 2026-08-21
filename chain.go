@@ -20,7 +20,7 @@ const rootKey = "SCHAIN_ROOT"
 
 // reserved keys configure a vault instead of being part of its
 // environment: they are never exported and never get a history entry.
-var reserved = map[string]bool{rootKey: true, historyKey: true}
+var reserved = map[string]bool{rootKey: true, historyKey: true, expandKey: true}
 
 // Indirection points for tests.
 var (
@@ -31,6 +31,7 @@ var (
 type chain struct {
 	vaults []*vault // root-most first
 	paths  []string // parallel to vaults
+	dirs   []string // parallel to vaults: what ${SCHAIN_DIR} means in each
 }
 
 // workDir is the current directory with symlinks resolved. Vault paths
@@ -83,8 +84,10 @@ func findVaults() ([]string, error) {
 // vaults are simply not there, and without this every one of them would
 // silently resolve to whatever an ancestor holds. Borrowed paths are
 // returned as they live in the main checkout, so a `remember` there covers
-// every worktree. SCHAIN_NO_WORKTREE=1 turns the fallback off.
-func resolveVaults() (paths []string, borrowed map[string]bool, err error) {
+// every worktree, mapped to the directory in this tree they stand in for,
+// which is the directory ${SCHAIN_DIR} means for their keys.
+// SCHAIN_NO_WORKTREE=1 turns the fallback off.
+func resolveVaults() (paths []string, borrowed map[string]string, err error) {
 	cwd, err := workDir()
 	if err != nil {
 		return nil, nil, err
@@ -107,7 +110,7 @@ func resolveVaults() (paths []string, borrowed map[string]bool, err error) {
 		dir = parent
 	}
 
-	borrowed = map[string]bool{}
+	borrowed = map[string]string{}
 	seen := map[string]bool{}
 	for i, dir := range levels {
 		p := filepath.Join(dir, vaultName)
@@ -123,7 +126,7 @@ func resolveVaults() (paths []string, borrowed map[string]bool, err error) {
 			if !isVaultFile(p) {
 				continue
 			}
-			borrowed[p] = true
+			borrowed[p] = dir
 		}
 		if !seen[p] {
 			seen[p] = true
@@ -140,7 +143,25 @@ func resolveVaults() (paths []string, borrowed map[string]bool, err error) {
 // of a linked worktree rather than in the tree being walked.
 func isBorrowed(path string) bool {
 	_, borrowed, err := resolveVaults()
-	return err == nil && borrowed[path]
+	return err == nil && borrowed[path] != ""
+}
+
+// vaultDirs is the directory each vault applies to, which ${SCHAIN_DIR}
+// resolves to for the keys it defines. That is the vault's own directory,
+// except for one borrowed from a worktree's main checkout: it stands in
+// for a directory in this tree, and a path built from it should land in
+// the checkout being worked in, not in the one the file happens to live
+// in. A path schain cannot place falls back to the file's own directory.
+func vaultDirs(paths []string) []string {
+	_, borrowed, err := resolveVaults()
+	dirs := make([]string, len(paths))
+	for i, p := range paths {
+		dirs[i] = filepath.Dir(p)
+		if err == nil && borrowed[p] != "" {
+			dirs[i] = borrowed[p]
+		}
+	}
+	return dirs
 }
 
 // warnedUnreachable keeps the warning to once per run.
@@ -276,6 +297,7 @@ func openChain() (*chain, error) {
 // passphrase asks once.
 func loadChain(paths []string) (*chain, error) {
 	c := &chain{}
+	dirs := vaultDirs(paths)
 	var known [][]byte
 	defer func() { wipeAll(known) }()
 	for i, p := range paths {
@@ -291,6 +313,7 @@ func loadChain(paths []string) (*chain, error) {
 		}
 		c.vaults = append([]*vault{v}, c.vaults...)
 		c.paths = append([]string{p}, c.paths...)
+		c.dirs = append([]string{dirs[i]}, c.dirs...)
 		if v.Secrets[rootKey] != "" {
 			break
 		}
@@ -529,18 +552,41 @@ func wipeAll(bs [][]byte) {
 	}
 }
 
-// secrets merges the chain: root-most first, nearest overwrites.
+// secrets merges the chain as stored: root-most first, nearest
+// overwrites. This is what "ls" reports.
 func (c *chain) secrets() map[string]string {
+	out, _ := c.merge(false)
+	return out
+}
+
+// env is the same merge with every opted-in value expanded against the
+// vault that defines it: what a child process actually gets. It differs
+// from secrets only for keys in a vault's SCHAIN_EXPAND, and "ls -v"
+// marks those, because a stored value that is not the injected value is
+// something you want to find out about once rather than debug twice.
+func (c *chain) env() (map[string]string, error) {
+	return c.merge(true)
+}
+
+func (c *chain) merge(expand bool) (map[string]string, error) {
 	out := make(map[string]string)
-	for _, v := range c.vaults {
+	for i, v := range c.vaults {
 		for k, val := range v.Secrets {
+			if expand && v.expands(k) {
+				got, err := expandValue(val, c.dirs[i])
+				if err != nil {
+					wipeMap(out)
+					return nil, fmt.Errorf("%s from %s: %w", k, display(c.paths[i]), err)
+				}
+				val = got
+			}
 			out[k] = val
 		}
 	}
 	for k := range reserved {
 		delete(out, k)
 	}
-	return out
+	return out, nil
 }
 
 // nearest is the vault for cwd itself, the one writes go to.
@@ -551,13 +597,21 @@ func (c *chain) nearest() (*vault, string) {
 
 // sourceOf names the vault a merged key ends up coming from.
 func (c *chain) sourceOf(k string) string {
+	_, src := c.definerOf(k)
+	return src
+}
+
+// definerOf is the vault a merged key ends up coming from, and its path.
+// The vault itself is what says whether the key is expanded.
+func (c *chain) definerOf(k string) (*vault, string) {
+	var def *vault
 	src := ""
 	for i, v := range c.vaults {
 		if _, ok := v.Secrets[k]; ok {
-			src = c.paths[i]
+			def, src = v, c.paths[i]
 		}
 	}
-	return src
+	return def, src
 }
 
 func (c *chain) close() {
