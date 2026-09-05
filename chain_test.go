@@ -573,7 +573,10 @@ func TestScopeFlag(t *testing.T) {
 
 func TestSecretEnvironChain(t *testing.T) {
 	t.Setenv("A", "stale")
-	env := secretEnviron(map[string]string{"A": "fresh"}, []string{"/p/.schain", "/p/c/.schain"}, "")
+	env, err := secretEnviron(map[string]string{"A": "fresh"}, []string{"/p/.schain", "/p/c/.schain"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	var seenA int
 	active := ""
 	for _, kv := range env {

@@ -357,6 +357,46 @@ func TestNewPassphraseStillRepeatsWhenTyped(t *testing.T) {
 	}
 }
 
+func TestPassphraseFileLength(t *testing.T) {
+	for _, tc := range []struct {
+		name, content string
+		wantLen       int
+		reject        bool
+	}{
+		{"overlong EOF", strings.Repeat("x", maxPassphrase+1), 0, true},
+		{"overlong LF", strings.Repeat("x", maxPassphrase+1) + "\n", 0, true},
+		{"overlong CRLF", strings.Repeat("x", maxPassphrase+1) + "\r\n", 0, true},
+		{"boundary EOF", strings.Repeat("x", maxPassphrase), maxPassphrase, false},
+		{"boundary LF", strings.Repeat("x", maxPassphrase) + "\n", maxPassphrase, false},
+		{"boundary CRLF", strings.Repeat("x", maxPassphrase) + "\r\n", maxPassphrase, false},
+		{"below boundary CRLF", strings.Repeat("x", maxPassphrase-1) + "\r\n", maxPassphrase - 1, false},
+		{"long later line", "pass\n" + strings.Repeat("x", maxPassphrase*3), 4, false},
+		{"boundary long later line", strings.Repeat("x", maxPassphrase) + "\r\n" + strings.Repeat("x", maxPassphrase*3), maxPassphrase, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := filepath.Join(t.TempDir(), "pass")
+			if err := os.WriteFile(name, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			pass, err := readPassphraseFile(name)
+			defer wipe(pass)
+			if tc.reject {
+				if err == nil || !strings.Contains(err.Error(), "more than 4096") {
+					t.Fatalf("error = %v; want length rejection", err)
+				}
+				if _, ok := err.(abortErr); !ok {
+					t.Fatalf("error %T must abort", err)
+				}
+				if pass != nil {
+					t.Fatal("returned truncated passphrase")
+				}
+			} else if err != nil || len(pass) != tc.wantLen {
+				t.Fatalf("length = %d, error = %v; want %d", len(pass), err, tc.wantLen)
+			}
+		})
+	}
+}
+
 func TestFirstLine(t *testing.T) {
 	for _, c := range []struct{ in, want string }{
 		{"pass\n", "pass"},

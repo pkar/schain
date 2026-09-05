@@ -6,7 +6,6 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
-	"time"
 )
 
 // macOS: login keychain via the system /usr/bin/security tool. Items are
@@ -29,17 +28,18 @@ func account() string {
 }
 
 // cacheStore writes the payload via `security -i` (commands on stdin) so
-// the secret never appears in an argv visible to `ps`. The payload is
-// hex+colon only, so no quoting issues.
+// the secret never appears in an argv visible to `ps`. The portable
+// command builder validates the payload and quotes account/service names.
 func cacheStore(vaultPath string, payload []byte, ttlSeconds int) error {
-	if ttlSeconds > 0 {
-		payload = append(append([]byte{}, payload...),
-			fmt.Sprintf(":%d", time.Now().Unix()+int64(ttlSeconds))...)
+	payload, err := payloadWithExpiry(payload, ttlSeconds)
+	if err != nil {
+		return err
 	}
-	cmd := exec.Command(securityBin, "-i")
-	cmd.Stdin = strings.NewReader(fmt.Sprintf(
-		"add-generic-password -U -a %s -s %s -w %s\n",
-		account(), keychainService(vaultPath), payload))
+	defer wipe(payload)
+	cmd, err := securityStoreCommand(securityBin, account(), keychainService(vaultPath), payload)
+	if err != nil {
+		return err
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("keychain store failed: %v: %s", err, strings.TrimSpace(string(out)))

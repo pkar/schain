@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,13 +13,21 @@ import (
 // init file that sources the user's normal startup files, then patches
 // the prompt, then deletes itself.
 
-// marker is the prompt prefix, single-quoted for safe embedding in
-// shell init code.
+// marker is raw data; each shell quotes it for its own parsing rules.
 var marker string
 
 func setMarker(vaultDir string) {
-	m := "(schain " + vaultDir + ") "
-	marker = "'" + strings.ReplaceAll(m, "'", `'\''`) + "'"
+	marker = "(schain " + vaultDir + ") "
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func fishQuote(s string) string {
+	// Unlike POSIX shells, fish interprets \\ and \' inside single quotes.
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return "'" + strings.ReplaceAll(s, "'", `\'`) + "'"
 }
 
 // subshellLaunch returns argv and env for spawning the subshell with a
@@ -61,7 +68,7 @@ func writeTemp(name, content string) (string, error) {
 	}
 	path := filepath.Join(dir, name)
 	// The init file removes its own directory once it has run.
-	content += fmt.Sprintf("\nrm -rf -- %q\n", dir)
+	content += "\nrm -rf -- " + shellQuote(dir) + "\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		os.RemoveAll(dir)
 		return "", err
@@ -72,14 +79,28 @@ func writeTemp(name, content string) (string, error) {
 // autoReloadFn wraps the schain binary in a shell function (defined only
 // inside schain subshells) so env-changing commands refresh the shell
 // automatically: the function can run `exec`, the child binary cannot.
+// env resolves the external binary consistently: Bash/fish cannot exec the
+// command builtin, while zsh's bare exec can recurse into the schain function.
 const autoReloadFn = `
 schain() {
   case "${1-}" in
-    ""|reload) exec command schain reload ;;
-    set|unset) command schain "$@" && exec command schain reload ;;
+    ""|reload) exec env schain reload ;;
+    set|unset) command schain "$@" && exec env schain reload ;;
     *) command schain "$@" ;;
   esac
 }`
+
+// bashPrompt inserts data through parameter expansion, after Bash has decoded
+// prompt escapes. Neither command substitutions nor backslashes in the marker
+// are interpreted again. With promptvars off, only prompt escapes need quoting.
+func bashPrompt() string {
+	return `__schain_marker=` + shellQuote(marker) + `
+if shopt -q promptvars; then
+  PS1='${__schain_marker}'"$PS1"
+else
+  PS1="${__schain_marker//\\/\\\\}$PS1"
+fi`
+}
 
 func bashInit() string {
 	if runtime.GOOS == "darwin" {
@@ -88,11 +109,11 @@ if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile"
 elif [ -f "$HOME/.bash_login" ]; then . "$HOME/.bash_login"
 elif [ -f "$HOME/.profile" ]; then . "$HOME/.profile"
 fi
-PS1=` + marker + `"$PS1"` + autoReloadFn
+` + bashPrompt() + autoReloadFn
 	}
 	return `[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
 [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
-PS1=` + marker + `"$PS1"` + autoReloadFn
+` + bashPrompt() + autoReloadFn
 }
 
 // zshDotDir builds a ZDOTDIR whose startup files chain to the user's
@@ -108,9 +129,22 @@ func zshDotDir() (string, error) {
 		".zprofile": `[ -f "$HOME/.zprofile" ] && . "$HOME/.zprofile"`,
 		".zlogin":   `[ -f "$HOME/.zlogin" ] && . "$HOME/.zlogin"`,
 		".zshrc": `[ -f "$HOME/.zshrc" ] && . "$HOME/.zshrc"
-PROMPT=` + marker + `"$PROMPT"
+__schain_marker=` + shellQuote(marker) + `
+# Parameter expansion is not recursively evaluated by PROMPT_SUBST, but
+# percent escapes are processed afterwards and must be quoted separately.
+if [[ -o promptpercent ]]; then
+  __schain_marker=${__schain_marker//\%/%%}
+fi
+if [[ -o promptbang ]]; then
+  __schain_marker=${__schain_marker//!/!!}
+fi
+if [[ -o promptsubst ]]; then
+  PROMPT='${__schain_marker}'"$PROMPT"
+else
+  PROMPT="$__schain_marker$PROMPT"
+fi
 ZDOTDIR="$HOME"
-` + autoReloadFn + "\n" + fmt.Sprintf("rm -rf -- %q", dir),
+` + autoReloadFn + "\nrm -rf -- " + shellQuote(dir),
 	}
 	for name, content := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(content+"\n"), 0o600); err != nil {
@@ -123,12 +157,12 @@ ZDOTDIR="$HOME"
 
 func fishInit() string {
 	return `functions -q fish_prompt; and functions -c fish_prompt __schain_prompt
-function fish_prompt; echo -n ` + marker + `; __schain_prompt; end
+function fish_prompt; printf '%s' ` + fishQuote(marker) + `; __schain_prompt; end
 function schain
   if test (count $argv) -eq 0; or test "$argv[1]" = reload
-    exec command schain reload
+    exec env schain reload
   else if contains -- $argv[1] set unset
-    command schain $argv; and exec command schain reload
+    command schain $argv; and exec env schain reload
   else
     command schain $argv
   end

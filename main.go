@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -584,14 +585,17 @@ func scopeFlag(args []string, cmd, tail string) (scope, []string, error) {
 // parseTTL accepts Go durations ("30m", "8h", "1h30m", "90s"); a bare
 // number means minutes.
 func parseTTL(s string) (int, error) {
+	// Bound before multiplication/conversion, including on 32-bit hosts and
+	// before the kernel's seconds field could truncate a large duration.
+	const maxTTLSeconds = 1<<31 - 1
 	if n, err := strconv.Atoi(s); err == nil {
-		if n <= 0 {
+		if n <= 0 || n > maxTTLSeconds/60 {
 			return 0, fmt.Errorf("bad duration %q", s)
 		}
 		return n * 60, nil
 	}
 	d, err := time.ParseDuration(s)
-	if err != nil || d < time.Second {
+	if err != nil || d < time.Second || d/time.Second > maxTTLSeconds {
 		return 0, fmt.Errorf("bad duration %q (use 30m, 8h, 1h30m, or minutes as a bare number)", s)
 	}
 	return int(d / time.Second), nil
@@ -649,9 +653,24 @@ func cmdForget(args []string) error {
 // first matters on reload: getenv returns the first match, so a stale
 // duplicate would shadow the fresh value. SCHAIN_ACTIVE holds the whole
 // chain, nearest last.
-func secretEnviron(secrets map[string]string, paths []string, shell string) []string {
-	skip := map[string]bool{"SCHAIN_ACTIVE": true, "SCHAIN_SHELL": true}
-	for k := range secrets {
+func secretEnviron(secrets map[string]string, paths []string, shell string) ([]string, error) {
+	skip := map[string]bool{"SCHAIN_ACTIVE": true, "SCHAIN_SHELL": true, "SCHAIN_KEYS": true}
+	if os.Getenv("SCHAIN_ACTIVE") != "" {
+		var previous []string
+		if err := json.Unmarshal([]byte(os.Getenv("SCHAIN_KEYS")), &previous); err != nil || previous == nil {
+			return nil, fmt.Errorf("missing or invalid schain key inventory; exit this shell and re-enter schain")
+		}
+		for _, k := range previous {
+			if k == "" || strings.ContainsAny(k, "=\x00") {
+				return nil, fmt.Errorf("invalid schain key inventory; exit this shell and re-enter schain")
+			}
+			skip[k] = true
+		}
+	}
+	for k, val := range secrets {
+		if k == "" || strings.ContainsAny(k, "=\x00") || strings.ContainsRune(val, '\x00') {
+			return nil, fmt.Errorf("vault contains an invalid environment entry")
+		}
 		skip[k] = true
 	}
 	var env []string
@@ -661,14 +680,22 @@ func secretEnviron(secrets map[string]string, paths []string, shell string) []st
 			env = append(env, kv)
 		}
 	}
-	for k, val := range secrets {
-		env = append(env, k+"="+val)
+	keys := make([]string, 0, len(secrets))
+	for _, k := range sortedKeys(secrets) {
+		// Internal markers must never be shadowed by vault entries.
+		if k == "SCHAIN_ACTIVE" || k == "SCHAIN_SHELL" || k == "SCHAIN_KEYS" {
+			continue
+		}
+		env = append(env, k+"="+secrets[k])
+		keys = append(keys, k)
 	}
+	inventory, _ := json.Marshal(keys) // a string slice cannot fail to marshal
+	env = append(env, "SCHAIN_KEYS="+string(inventory))
 	env = append(env, "SCHAIN_ACTIVE="+strings.Join(paths, string(os.PathListSeparator)))
 	if shell != "" {
 		env = append(env, "SCHAIN_SHELL="+shell)
 	}
-	return env
+	return env, nil
 }
 
 // chainLabel describes where the env came from, e.g. "~/work/app +1 inherited".
@@ -696,7 +723,13 @@ func enterShell(c *chain) error {
 		return err
 	}
 	setMarker(display(near))
-	argv, env := subshellLaunch(shell, secretEnviron(secrets, c.paths, shell))
+	env, err := secretEnviron(secrets, c.paths, shell)
+	if err != nil {
+		wipeMap(secrets)
+		c.close()
+		return err
+	}
+	argv, env := subshellLaunch(shell, env)
 	fmt.Fprintf(os.Stderr, "schain: entering shell with env from %s (%d keys), exit to leave\n",
 		chainLabel(c), len(secrets))
 	wipeMap(secrets)
@@ -789,9 +822,12 @@ func cmdExec(cmdline []string) error {
 		c.close()
 		return err
 	}
-	env := secretEnviron(secrets, c.paths, "")
+	env, err := secretEnviron(secrets, c.paths, "")
 	wipeMap(secrets)
 	c.close()
+	if err != nil {
+		return err
+	}
 	return execReplace(bin, cmdline, env)
 }
 

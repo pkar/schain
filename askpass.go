@@ -126,7 +126,9 @@ func readPassphraseFile(name string) ([]byte, error) {
 	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
 		return fail(fmt.Errorf("%s is readable by group or others (mode %04o); chmod 600 it", name, perm))
 	}
-	buf := make([]byte, maxPassphrase)
+	// Look past the limit far enough to distinguish a full-length CRLF
+	// line from a truncated passphrase. Later lines do not count.
+	buf := make([]byte, maxPassphrase+2)
 	n, err := io.ReadFull(f, buf)
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		wipe(buf)
@@ -134,6 +136,10 @@ func readPassphraseFile(name string) ([]byte, error) {
 	}
 	pass := firstLine(buf[:n])
 	wipe(buf)
+	if len(pass) > maxPassphrase {
+		wipe(pass)
+		return fail(fmt.Errorf("%s first line holds more than %d bytes", name, maxPassphrase))
+	}
 	if len(pass) == 0 {
 		return fail(fmt.Errorf("%s holds no passphrase", name))
 	}

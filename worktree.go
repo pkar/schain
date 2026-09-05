@@ -16,9 +16,12 @@ import (
 //
 //	<worktree>/.git            a file: "gitdir: <main>/.git/worktrees/<name>"
 //	<that dir>/commondir       "../.." -> <main>/.git, whose parent is <main>
+//	<that dir>/gitdir          the reciprocal path to <worktree>/.git
 //
-// Submodules use the same .git-file indirection but have no commondir, so
-// requiring commondir keeps them out.
+// Submodules use the same .git-file indirection but have no commondir.
+// Borrowing requires both canonical registration inside the main .git
+// directory and its backlink; checkout-controlled indirection alone is
+// not authority to read the main checkout's cached vaults.
 
 type worktree struct {
 	root string // the linked checkout
@@ -26,6 +29,14 @@ type worktree struct {
 }
 
 func findWorktree(dir string) *worktree {
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil
+	}
+	dir, err = filepath.EvalSymlinks(dir)
+	if err != nil {
+		return nil
+	}
 	blob, err := os.ReadFile(filepath.Join(dir, ".git"))
 	if err != nil {
 		return nil // absent, or a directory: this is a normal checkout
@@ -38,6 +49,10 @@ func findWorktree(dir string) *worktree {
 	if !filepath.IsAbs(gitDir) {
 		gitDir = filepath.Join(dir, gitDir)
 	}
+	gitDir, err = filepath.EvalSymlinks(gitDir)
+	if err != nil {
+		return nil
+	}
 	common, err := os.ReadFile(filepath.Join(gitDir, "commondir"))
 	if err != nil {
 		return nil // submodule or something else, not a worktree
@@ -46,14 +61,32 @@ func findWorktree(dir string) *worktree {
 	if !filepath.IsAbs(c) {
 		c = filepath.Join(gitDir, c)
 	}
-	c = filepath.Clean(c)
-	if filepath.Base(c) != ".git" {
+	c, err = filepath.EvalSymlinks(c)
+	if err != nil || filepath.Base(c) != ".git" {
 		return nil // bare or --separate-git-dir: no main checkout to borrow from
 	}
-	main := filepath.Dir(c)
-	if resolved, err := filepath.EvalSymlinks(main); err == nil {
-		main = resolved // match the physical paths the cwd walk produces
+	// A commondir supplied by the checkout is not proof of registration.
+	// Compare physical paths so symlinked or traversing metadata cannot
+	// impersonate an entry in the main repository's worktrees directory.
+	if filepath.Dir(gitDir) != filepath.Join(c, "worktrees") {
+		return nil
 	}
+	backlink, err := os.ReadFile(filepath.Join(gitDir, "gitdir"))
+	if err != nil {
+		return nil
+	}
+	back := strings.TrimSpace(string(backlink))
+	if back == "" {
+		return nil
+	}
+	if !filepath.IsAbs(back) {
+		back = filepath.Join(gitDir, back)
+	}
+	back, err = filepath.EvalSymlinks(back)
+	if err != nil || back != filepath.Join(dir, ".git") {
+		return nil // registered for a different checkout, not this one
+	}
+	main := filepath.Dir(c)
 	if main == dir {
 		return nil
 	}

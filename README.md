@@ -10,7 +10,7 @@ One-liner (uses the prebuilt binary from the latest [release](https://github.com
 curl -fsSL https://raw.githubusercontent.com/pkar/schain/main/install.sh | sh
 ```
 
-Prebuilt targets: linux amd64/arm64, macOS arm64. Anything else builds from source.
+Prebuilt targets: linux amd64/arm64, macOS arm64. Anything else builds from source. The installer resolves one release tag, verifies prebuilt binaries against that release's SHA-256 checksums, and uses the same tag for source builds. This still trusts GitHub and the release publisher; checksums are not independent signatures. Source builds require Go 1.26.8 or newer.
 
 Or with the Go toolchain directly:
 
@@ -54,6 +54,8 @@ $ exit          # secrets gone
 ```
 
 Changing secrets from inside the subshell just works: after `schain set` or `schain unset`, the shell swaps itself for a fresh one with the updated vault (no nesting, one `exit` still leaves). A shell's environment is fixed at start, so schain defines a `schain` wrapper function inside its own subshells that runs `exec schain reload` after env-changing commands. Bare `schain` and `schain reload` inside a subshell also refresh. In shells other than bash/zsh/fish, refresh manually with `exec schain reload`.
+
+Reload removes all previously injected keys before adding the current ones, including keys deleted from the vault. `$SCHAIN_KEYS` records key names only for this purpose; do not edit it. Shells entered with an older schain lack this inventory and must be exited and re-entered after upgrading. Pre-existing values shadowed by vault keys are not restored on reload. Already-running children retain their old environment; revoking a credential at its issuer is still necessary when it must stop working everywhere.
 
 Or wrap a single command:
 
@@ -236,7 +238,7 @@ The rest of the rules:
 - **Writes go to the main checkout.** `set`, `unset`, and `passwd` acting on a borrowed vault change that one file, so a rotation from a worktree is visible everywhere at once. schain names the file on stderr when it does this.
 - **`${SCHAIN_DIR}` points here, not there.** A key expanded out of a borrowed vault resolves to the directory in this checkout, so one vault file gives each worktree its own paths (see [Paths that follow the vault](#paths-that-follow-the-vault)).
 - **A worktree outside the vault root gets a warning**, naming the vaults the main checkout composes with that this worktree cannot reach.
-- Detection reads git's own files (`.git` → `commondir`), so no `git` binary is needed. Submodules use the same `.git` indirection but have no `commondir`, so they never borrow. `SCHAIN_NO_WORKTREE=1` turns the whole thing off.
+- Detection reads git's own files (`.git` → `commondir`), so no `git` binary is needed. Borrowing requires a canonical registration inside the main checkout's `.git/worktrees` and a matching `gitdir` backlink. Unregistered or forged metadata does not authorize borrowing. Submodules never borrow. `SCHAIN_NO_WORKTREE=1` turns the whole thing off.
 
 Upgrading from 0.0.1: a nested vault used to hide its ancestors. Now they contribute keys, so variables you did not see before can appear. `SCHAIN_NO_INHERIT=1`, or `SCHAIN_ROOT=1` inside the vault, restores the old scope.
 
@@ -336,7 +338,7 @@ Built entirely on the Go standard library's crypto:
 - Integrity: the header (magic, iteration count, salt) is bound as AEAD additional data, so KDF parameter tampering fails decryption. Any bit flip anywhere in the file is rejected.
 - Files written 0600 via temp file + rename (no partial writes).
 - `schain exec` and the subshell use `execve`, replacing the schain process. No parent process holds decrypted secrets.
-- Iteration count below 100,000 in a vault file is refused (downgrade guard).
+- Iteration counts outside 100,000–10,000,000 are refused before key derivation. Vaults, including encrypted history, are limited to 16 MiB on read and write to bound unauthenticated resource consumption.
 - Key material is zeroed after use, best effort (Go's GC can copy memory).
 - Non-interactive input is opt-in and stays out of argv and the environment: a helper's answer arrives over a pipe, a passphrase file has to be `0600`, and there is no passphrase environment variable to inherit.
 - Replaced values are kept in the vault (see [History](#history)), so a value survives `unset` until it ages out or you `purge`. Everything stays inside the same encrypted file.
@@ -345,6 +347,8 @@ Built entirely on the Go standard library's crypto:
 Committing `.schain` to git: it is ciphertext, so it only exposes what any encrypted blob exposes (size, and it invites offline passphrase guessing). With a strong passphrase that is fine; with a weak one, add it to `.gitignore`.
 
 What it does not protect against: anything running as your user while secrets are in a live process environment (`/proc/<pid>/environ` on Linux is readable by the owner), swap without encryption, or a compromised machine.
+
+Directory names are rendered as prompt data, not shell code. Vault saves use exclusively created random 0600 temporary files rather than a reusable `.schain.tmp` name. Passphrase files reject first lines longer than 4096 bytes rather than silently truncating them. Failed Linux cache configuration attempts revoke and unlink the inserted key; cleanup errors are reported rather than hidden.
 
 ## Tests
 

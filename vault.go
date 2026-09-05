@@ -11,11 +11,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -44,6 +46,8 @@ const (
 	keyLen       = 32
 	defaultIters = 600_000
 	minIters     = 100_000
+	maxIters     = 10_000_000 // bound unauthenticated work before AEAD verification
+	maxVaultSize = 16 << 20   // includes header, ciphertext and history
 )
 
 var errBadPassphrase = errors.New("wrong passphrase or corrupted vault")
@@ -105,8 +109,34 @@ type vaultFile struct {
 	sum               [32]byte // of the whole file, for change detection
 }
 
+// readVaultBytes also bounds conflict checks, not just decryption. Stat is
+// insufficient on its own because a file may grow after it is inspected.
+func readVaultBytes(path string) ([]byte, error) {
+	// A path swapped for a FIFO must not block before the type check.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() || fi.Size() > maxVaultSize {
+		return nil, fmt.Errorf("%s: vault must be a regular file no larger than %d bytes", path, maxVaultSize)
+	}
+	blob, err := io.ReadAll(io.LimitReader(f, maxVaultSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(blob) > maxVaultSize {
+		return nil, fmt.Errorf("%s: vault exceeds %d bytes", path, maxVaultSize)
+	}
+	return blob, nil
+}
+
 func readVaultFile(path string) (*vaultFile, error) {
-	blob, err := os.ReadFile(path)
+	blob, err := readVaultBytes(path)
 	if err != nil {
 		return nil, err
 	}
@@ -125,6 +155,9 @@ func readVaultFile(path string) (*vaultFile, error) {
 	iters := int(binary.BigEndian.Uint32(blob[magicLen:]))
 	if iters < minIters {
 		return nil, fmt.Errorf("%s: refusing weak iteration count %d", path, iters)
+	}
+	if iters > maxIters {
+		return nil, fmt.Errorf("%s: iteration count %d exceeds supported maximum %d", path, iters, maxIters)
 	}
 	return &vaultFile{
 		magic: m,
@@ -224,16 +257,33 @@ func (v *vault) save(path string) error {
 	}
 	hdr := header(m, v.iters, v.salt)
 	out := append(append(hdr, nonce...), aead.Seal(nil, nonce, plain, hdr)...)
+	if len(out) > maxVaultSize {
+		return fmt.Errorf("%s: vault exceeds %d bytes; reduce values or purge history", path, maxVaultSize)
+	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+	// Exclusive creation prevents following a planted symlink or inheriting
+	// an existing file's permissions. Keep the temporary file on this filesystem.
+	f, err := os.CreateTemp(filepath.Dir(path), ".schain-tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if _, err := f.Write(out); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
 		return err
 	}
 	// Only the envelope carries the counter, so a vault written in the old
@@ -255,7 +305,7 @@ func (v *vault) checkUnchanged(path string) error {
 	if os.Getenv("SCHAIN_FORCE") != "" {
 		return nil
 	}
-	fresh, err := os.ReadFile(path)
+	fresh, err := readVaultBytes(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return err

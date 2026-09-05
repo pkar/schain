@@ -26,8 +26,8 @@ func layout(t *testing.T, dirs ...string) func(string) string {
 }
 
 // fakeWorktree builds git's linked-worktree layout by hand: the .git file
-// in the worktree, and the commondir that points back at the main
-// checkout. Kept honest by TestWorktreeRealGit below.
+// in the worktree, commondir, and the reciprocal registration gitdir.
+// Kept honest by TestWorktreeRealGit below.
 func fakeWorktree(t *testing.T, main, wt, name string) {
 	t.Helper()
 	gitDir := filepath.Join(main, ".git", "worktrees", name)
@@ -37,12 +37,170 @@ func fakeWorktree(t *testing.T, main, wt, name string) {
 	if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte("../..\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(gitDir, "gitdir"), []byte(filepath.Join(wt, ".git")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(wt, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestWorktreeRejectsExternalMetadata(t *testing.T) {
+	at := layout(t, "repo/.git", "attacker/metadata", "attacker/wt")
+	for path, value := range map[string]string{
+		"attacker/wt/.git":            "gitdir: " + at("attacker/metadata") + "\n",
+		"attacker/metadata/commondir": at("repo/.git") + "\n",
+		"attacker/metadata/gitdir":    at("attacker/wt/.git") + "\n",
+	} {
+		if err := os.WriteFile(at(path), []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := findWorktree(at("attacker/wt")); got != nil {
+		t.Fatalf("forged external metadata borrowed main checkout: %+v", got)
+	}
+}
+
+func TestWorktreeRequiresReciprocalRegistration(t *testing.T) {
+	for _, backlink := range []string{"missing", "", "other/.git", "wt/other"} {
+		t.Run(backlink, func(t *testing.T) {
+			at := layout(t, "repo", "wt", "other")
+			fakeWorktree(t, at("repo"), at("wt"), "wt")
+			path := at("repo/.git/worktrees/wt/gitdir")
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if backlink != "missing" {
+				value := backlink
+				if value != "" {
+					value = at(value)
+				}
+				if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := findWorktree(at("wt")); got != nil {
+				t.Fatalf("accepted invalid backlink %q: %+v", backlink, got)
+			}
+		})
+	}
+}
+
+func TestWorktreeCanonicalCheckout(t *testing.T) {
+	at := layout(t, "repo", "wt")
+	fakeWorktree(t, at("repo"), at("wt"), "wt")
+	if err := os.Symlink(at("wt"), at("alias")); err != nil {
+		t.Fatal(err)
+	}
+	if got := findWorktree(at("alias")); got == nil || got.root != at("wt") || got.main != at("repo") {
+		t.Fatalf("canonical checkout lookup = %+v", got)
+	}
+}
+
+func TestWorktreeRejectsRegistrationBypasses(t *testing.T) {
+	for _, attack := range []string{"copied-git-file", "symlink-git-file", "external-entry", "external-worktrees", "traversal", "nested-entry", "common-alias"} {
+		t.Run(attack, func(t *testing.T) {
+			at := layout(t, "repo", "wt", "attacker", "outside")
+			fakeWorktree(t, at("repo"), at("wt"), "wt")
+			write := func(path, value string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			link := func(target, path string) {
+				t.Helper()
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			entry := at("repo/.git/worktrees/wt")
+			checkout := at("attacker")
+			switch attack {
+			case "copied-git-file":
+				write(at("attacker/.git"), "gitdir: "+entry)
+			case "symlink-git-file":
+				link(at("wt/.git"), at("attacker/.git"))
+			case "external-entry", "external-worktrees":
+				source, target := entry, at("outside/entry")
+				if attack == "external-worktrees" {
+					source, target = at("repo/.git/worktrees"), at("outside/worktrees")
+				}
+				if err := os.Rename(source, target); err != nil {
+					t.Fatal(err)
+				}
+				link(target, source)
+				write(filepath.Join(entry, "commondir"), at("repo/.git"))
+				write(filepath.Join(entry, "gitdir"), at("attacker/.git"))
+				write(at("attacker/.git"), "gitdir: "+entry)
+			case "traversal", "nested-entry":
+				path := at("repo/.git/worktrees") + "/../../metadata"
+				if attack == "nested-entry" {
+					path = filepath.Join(entry, "nested")
+				}
+				if err := os.MkdirAll(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				write(filepath.Join(path, "commondir"), at("repo/.git"))
+				write(filepath.Join(path, "gitdir"), at("attacker/.git"))
+				write(at("attacker/.git"), "gitdir: "+path)
+			case "common-alias":
+				// The attacker's .git points at the victim's real common dir,
+				// but the forged registration remains outside that common dir.
+				link(at("repo/.git"), at("outside/.git"))
+				if err := os.MkdirAll(at("attacker/metadata"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				write(at("attacker/metadata/commondir"), at("outside/.git"))
+				write(at("attacker/metadata/gitdir"), at("attacker/.git"))
+				write(at("attacker/.git"), "gitdir: "+at("attacker/metadata"))
+			}
+			if got := findWorktree(checkout); got != nil {
+				t.Fatalf("accepted %s: %+v", attack, got)
+			}
+		})
+	}
+}
+
+func TestWorktreeRelativeRegistration(t *testing.T) {
+	at := layout(t, "repo", "wt")
+	fakeWorktree(t, at("repo"), at("wt"), "wt")
+	for path, value := range map[string]string{
+		"wt/.git":                       "gitdir: ../repo/.git/worktrees/wt\n",
+		"repo/.git/worktrees/wt/gitdir": "../../../../wt/.git\n",
+	} {
+		if err := os.WriteFile(at(path), []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(at(""))
+	if got := findWorktree("wt"); got == nil || got.root != at("wt") || got.main != at("repo") {
+		t.Fatalf("relative registration lookup = %+v", got)
+	}
+}
+
+func TestWorktreeForgedMetadataCannotBorrowCachedVault(t *testing.T) {
+	at := layout(t, "repo/.git", "attacker/metadata", "attacker/wt/child")
+	mainVault := mkVault(t, at("repo"), "secret", map[string]string{"PRIVATE": "victim"})
+	// The child vault does not shadow the main checkout's root vault.
+	childVault := mkVault(t, at("attacker/wt/child"), "local", map[string]string{"LOCAL": "allowed"})
+	for path, value := range map[string]string{
+		"attacker/wt/.git":            "gitdir: ../metadata\n",
+		"attacker/metadata/commondir": at("repo/.git") + "\n",
+		"attacker/metadata/gitdir":    at("attacker/wt/.git") + "\n",
+	} {
+		if err := os.WriteFile(at(path), []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stubCache(t, map[string]string{mainVault: "secret", childVault: "local"})
+	stubPrompt(t)
+	captureStderr(t)
+	t.Chdir(at("attacker/wt/child"))
+	wantSecrets(t, chainKeys(t), map[string]string{"LOCAL": "allowed"})
 }
 
 func chainKeys(t *testing.T) map[string]string {

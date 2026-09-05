@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"syscall"
 	"unsafe"
@@ -17,6 +18,7 @@ import (
 const (
 	keySpecUserKeyring = ^uintptr(3) // KEY_SPEC_USER_KEYRING (-4)
 
+	keyctlRevoke     = 3
 	keyctlSetPerm    = 5
 	keyctlUnlink     = 9
 	keyctlSearch     = 10
@@ -35,32 +37,65 @@ const (
 
 func keyDesc(vaultPath string) string { return "schain:" + vaultPath }
 
-func cacheStore(vaultPath string, payload []byte, ttlSeconds int) error {
+// Typed seams keep Go pointers alive through add_key and let tests inject
+// kernel failures without creating real keys.
+var cacheAddKey = func(vaultPath string, payload []byte) (uintptr, error) {
+	return addCacheKey(vaultPath, payload)
+}
+var cacheKeyctl = func(op, id, arg uintptr) syscall.Errno {
+	_, _, errno := syscall.Syscall6(syscall.SYS_KEYCTL, op, id, arg, 0, 0, 0)
+	return errno
+}
+
+func addCacheKey(vaultPath string, payload []byte) (uintptr, error) {
 	typ, err := syscall.BytePtrFromString("user")
 	if err != nil {
-		return err
+		return 0, err
 	}
 	desc, err := syscall.BytePtrFromString(keyDesc(vaultPath))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	id, _, errno := syscall.Syscall6(syscall.SYS_ADD_KEY,
 		uintptr(unsafe.Pointer(typ)), uintptr(unsafe.Pointer(desc)),
 		uintptr(unsafe.Pointer(&payload[0])), uintptr(len(payload)),
 		keySpecUserKeyring, 0)
 	if errno != 0 {
-		return keyringErr("add_key", errno)
+		return 0, keyringErr("add_key", errno)
 	}
-	if _, _, errno := syscall.Syscall6(syscall.SYS_KEYCTL,
-		keyctlSetPerm, id, keyPerm, 0, 0, 0); errno != 0 {
+	return id, nil
+}
+
+func cacheStore(vaultPath string, payload []byte, ttlSeconds int) (err error) {
+	payload, err = payloadWithExpiry(payload, ttlSeconds)
+	if err != nil {
+		return err
+	}
+	defer wipe(payload)
+	id, err := cacheAddKey(vaultPath, payload)
+	if err != nil {
+		return err
+	}
+	// add_key may update an existing key. On any configuration failure,
+	// revoke that exact ID (including other links), then unlink it. Never
+	// leave the newly written secret cached indefinitely after an error.
+	defer func() {
+		if err == nil {
+			return
+		}
+		if errno := cacheKeyctl(keyctlRevoke, id, 0); errno != 0 {
+			err = errors.Join(err, keyringErr("rollback revoke", errno))
+		}
+		if errno := cacheKeyctl(keyctlUnlink, id, keySpecUserKeyring); errno != 0 {
+			err = errors.Join(err, keyringErr("rollback unlink", errno))
+		}
+	}()
+	if errno := cacheKeyctl(keyctlSetPerm, id, keyPerm); errno != 0 {
 		return keyringErr("keyctl setperm", errno)
 	}
-	if ttlSeconds > 0 {
-		_, _, errno = syscall.Syscall6(syscall.SYS_KEYCTL,
-			keyctlSetTimeout, id, uintptr(ttlSeconds), 0, 0, 0)
-		if errno != 0 {
-			return keyringErr("keyctl set_timeout", errno)
-		}
+	// Explicit zero clears an earlier timeout when add_key updates a key.
+	if errno := cacheKeyctl(keyctlSetTimeout, id, uintptr(ttlSeconds)); errno != 0 {
+		return keyringErr("keyctl set_timeout", errno)
 	}
 	return nil
 }
@@ -71,7 +106,7 @@ func cacheStore(vaultPath string, payload []byte, ttlSeconds int) error {
 func keyringErr(op string, errno syscall.Errno) error {
 	switch errno {
 	case syscall.EPERM, syscall.ENOSYS:
-		return fmt.Errorf("%s: %v (no kernel keyring here; container runtimes commonly block add_key and keyctl, so `remember` cannot cache anything)", op, errno)
+		return fmt.Errorf("%s: %v (kernel keyring operation unavailable or denied; container runtimes commonly restrict add_key and keyctl)", op, errno)
 	case syscall.EACCES:
 		return fmt.Errorf("%s: %v (a key cached by schain 0.0.7 or older can only be used from the session that cached it; `schain forget` there, then remember again)", op, errno)
 	case syscall.EDQUOT:
