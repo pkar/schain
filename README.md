@@ -220,7 +220,7 @@ This narrows the window rather than closing it: schain takes no lock, so another
 A linked worktree is a second checkout at another path. Vault files are untracked, so a fresh worktree has none of the repo's per-directory vaults, and every key that a child vault existed to override would quietly resolve to whatever an ancestor holds. schain closes that gap at lookup time: inside a linked worktree, a directory with no vault of its own uses the **main checkout's** vault at the same repo-relative path.
 
 ```sh
-$ cd ~/work/repo/.claude/worktrees/feature/prod
+$ cd ~/work/repo/.worktrees/feature/prod
 $ schain ls -v
 API_TOKEN    ~/work/repo/prod (main checkout)
 DB_PASSWORD  ~/work

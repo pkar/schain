@@ -430,11 +430,12 @@ func TestCmdWorktreeReport(t *testing.T) {
 	}
 }
 
-// A worktree nested inside the main checkout (how Claude Code creates
-// them) must not report its own vaults as the main checkout's.
+// A worktree nested inside the main checkout, which is where a tool that
+// parks worktrees under a dotdir puts them, must not report its own vaults as
+// the main checkout's.
 func TestCmdWorktreeReportNested(t *testing.T) {
-	at := layout(t, "repo/prod", "repo/.claude/worktrees/foo/db")
-	wt := at("repo/.claude/worktrees/foo")
+	at := layout(t, "repo/prod", "repo/.worktrees/foo/db")
+	wt := at("repo/.worktrees/foo")
 	mkVault(t, at("repo/prod"), "p", nil)
 	fakeWorktree(t, at("repo"), wt, "foo")
 	mkVault(t, filepath.Join(wt, "db"), "p", nil)
@@ -446,7 +447,7 @@ func TestCmdWorktreeReportNested(t *testing.T) {
 	}
 	got := out()
 	for _, line := range strings.Split(got, "\n") {
-		if strings.HasPrefix(line, "  ") && strings.Contains(line, ".claude") {
+		if strings.HasPrefix(line, "  ") && strings.Contains(line, ".worktrees") {
 			t.Errorf("report lists the worktree's own vault as the main checkout's: %q", line)
 		}
 	}
